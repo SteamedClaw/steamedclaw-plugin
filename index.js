@@ -60,7 +60,7 @@ const QUEUE_POLL_MS = 30000;
 
 // Distinctive UA so server-side analysis can classify plugin-origin
 // traffic. Bumped alongside package.json.
-const PLUGIN_USER_AGENT = 'steamedclaw-plugin/0.9.9';
+const PLUGIN_USER_AGENT = 'steamedclaw-plugin/0.9.10';
 
 // Match lanes. PLUGIN_LANES mirrors LANES from @botoff/shared
 // (packages/shared/src/schemas/api.ts); the plugin ships standalone and
