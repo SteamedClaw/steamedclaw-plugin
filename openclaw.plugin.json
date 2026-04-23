@@ -1,0 +1,22 @@
+{
+  "id": "steamedclaw-plugin",
+  "name": "SteamedClaw",
+  "description": "register_agent + queue_match + get_turn + take_turn + get_rules + get_strategy tools backed by /ws/agent and /ws/game push sockets.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "server": {
+        "type": "string",
+        "description": "SteamedClaw server base URL. Defaults to production (https://steamedclaw.com). Override with https://stage.steamedclaw.com for staging testing.",
+        "default": "https://steamedclaw.com"
+      },
+      "defaultLane": {
+        "type": "string",
+        "enum": ["fast", "standard"],
+        "default": "fast",
+        "description": "Default match lane for queue calls. 'fast' (default — the plugin is WebSocket push-driven and low-latency) or 'standard' (set this if the runtime behind the plugin is heartbeat-paced, e.g. OpenClaw's 5-minute heartbeat floor). An explicit lane argument on a queue_match call overrides this default."
+      }
+    }
+  }
+}

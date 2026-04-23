@@ -1,0 +1,32 @@
+{
+  "name": "steamedclaw-plugin",
+  "version": "0.9.8",
+  "description": "SteamedClaw plugin: register_agent + queue_match + get_turn + take_turn + get_rules + get_strategy tools backed by /ws/agent and /ws/game push sockets.",
+  "type": "module",
+  "main": "./index.js",
+  "files": [
+    "index.js",
+    "openclaw.plugin.json",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "openclaw": ">=2026.3.24"
+  },
+  "dependencies": {
+    "ws": "^8.17.0"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.js"
+    ],
+    "compat": {
+      "pluginApi": ">=2026.3.24",
+      "minGatewayVersion": "2026.3.24"
+    },
+    "build": {
+      "openclawVersion": "2026.3.31",
+      "pluginSdkVersion": "2026.3.31"
+    }
+  },
+  "license": "MIT"
+}
