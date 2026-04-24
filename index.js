@@ -60,7 +60,7 @@ const QUEUE_POLL_MS = 30000;
 
 // Distinctive UA so server-side analysis can classify plugin-origin
 // traffic. Bumped alongside package.json.
-const PLUGIN_USER_AGENT = 'steamedclaw-plugin/0.9.10';
+const PLUGIN_USER_AGENT = 'steamedclaw-plugin/0.9.11';
 
 // Match lanes. PLUGIN_LANES mirrors LANES from @botoff/shared
 // (packages/shared/src/schemas/api.ts); the plugin ships standalone and
@@ -293,7 +293,7 @@ function makeRegisterAgent(api, matchSvc, agentSvc, pollSvc) {
         ok: false,
         error: 'config_error',
         message:
-          'Plugin config missing "server". Ask the operator to set plugins.steamedclaw-ws.server in openclaw.json.',
+          'Plugin config missing "server". Ask the operator to set plugins.steamedclaw-plugin.server in openclaw.json.',
       };
     }
     inFlight = (async () => {
@@ -304,7 +304,7 @@ function makeRegisterAgent(api, matchSvc, agentSvc, pollSvc) {
         try {
           res = await httpRequest('POST', `${server}/api/agents`, null, body);
         } catch (err) {
-          api.logger.warn?.(`[steamedclaw-ws] register_agent network error: ${err.message}`);
+          api.logger.warn?.(`[steamedclaw-match] register_agent network error: ${err.message}`);
           return {
             ok: false,
             error: 'network_error',
@@ -315,7 +315,7 @@ function makeRegisterAgent(api, matchSvc, agentSvc, pollSvc) {
           const data = res.data ?? {};
           if (!data.id || !data.apiKey) {
             api.logger.warn?.(
-              '[steamedclaw-ws] register_agent response missing id/apiKey — cannot persist credentials',
+              '[steamedclaw-match] register_agent response missing id/apiKey — cannot persist credentials',
             );
             return {
               ok: false,
@@ -329,7 +329,7 @@ function makeRegisterAgent(api, matchSvc, agentSvc, pollSvc) {
             writeCredentials(server, data.id, data.apiKey, name);
           } catch (err) {
             api.logger.warn?.(
-              `[steamedclaw-ws] register_agent credentials persist failed: ${err.message}`,
+              `[steamedclaw-match] register_agent credentials persist failed: ${err.message}`,
             );
             return {
               ok: false,
@@ -351,16 +351,18 @@ function makeRegisterAgent(api, matchSvc, agentSvc, pollSvc) {
               writeClaimIfAbsent(claimUrl, verificationCode);
             } catch (err) {
               api.logger.warn?.(
-                `[steamedclaw-ws] claim.md write failed: ${err.message} — operatorNotice still delivered in tool response`,
+                `[steamedclaw-match] claim.md write failed: ${err.message} — operatorNotice still delivered in tool response`,
               );
             }
-            api.logger.info?.(`[steamedclaw-ws] OPERATOR ACTION: claim this agent at ${claimUrl}`);
+            api.logger.info?.(
+              `[steamedclaw-match] OPERATOR ACTION: claim this agent at ${claimUrl}`,
+            );
             if (verificationCode) {
-              api.logger.info?.(`[steamedclaw-ws] verification code: ${verificationCode}`);
+              api.logger.info?.(`[steamedclaw-match] verification code: ${verificationCode}`);
             }
           }
           api.logger.info?.(
-            `[steamedclaw-ws] registered agent "${name}" id=${data.id}; credentials written`,
+            `[steamedclaw-match] registered agent "${name}" id=${data.id}; credentials written`,
           );
           // Notify services so agent-ws opens its /ws/agent socket and
           // match-ws picks up any current match. Without this, services
@@ -384,7 +386,7 @@ function makeRegisterAgent(api, matchSvc, agentSvc, pollSvc) {
         }
         if (res.status === 409) {
           api.logger.info?.(
-            `[steamedclaw-ws] register_agent 409 name_taken: "${name}" — LLM should retry with a different name`,
+            `[steamedclaw-match] register_agent 409 name_taken: "${name}" — LLM should retry with a different name`,
           );
           return {
             ok: false,
@@ -402,7 +404,7 @@ function makeRegisterAgent(api, matchSvc, agentSvc, pollSvc) {
               'Name is invalid. Must be 1-64 chars, letters/numbers/hyphens/spaces/underscores only.',
           };
         }
-        api.logger.warn?.(`[steamedclaw-ws] register_agent failed: HTTP ${res.status}`);
+        api.logger.warn?.(`[steamedclaw-match] register_agent failed: HTTP ${res.status}`);
         return {
           ok: false,
           error: 'register_failed',
@@ -630,7 +632,7 @@ function makeMatchWsService(api) {
     const delay = Math.min(RECONNECT_BASE_MS * 2 ** reconnectAttempts, RECONNECT_MAX_MS);
     reconnectAttempts += 1;
     logger.info?.(
-      `[steamedclaw-ws] reconnecting match ${matchId} in ${delay}ms (attempt ${reconnectAttempts})`,
+      `[steamedclaw-match] reconnecting match ${matchId} in ${delay}ms (attempt ${reconnectAttempts})`,
     );
     reconnectTimer = setTimeout(() => connect(matchId, creds), delay);
   }
@@ -638,16 +640,16 @@ function makeMatchWsService(api) {
   function wakeAgent(reason) {
     try {
       api.runtime.system.requestHeartbeatNow();
-      logger.info?.(`[steamedclaw-ws] requested heartbeat wake (${reason})`);
+      logger.info?.(`[steamedclaw-match] requested heartbeat wake (${reason})`);
     } catch (err) {
-      logger.warn?.(`[steamedclaw-ws] requestHeartbeatNow failed: ${err.message}`);
+      logger.warn?.(`[steamedclaw-match] requestHeartbeatNow failed: ${err.message}`);
     }
   }
 
   function connect(matchId, creds) {
     if (stopped || currentMatchId !== matchId) return;
     const url = httpToWsUrl(creds.server, matchId);
-    logger.info?.(`[steamedclaw-ws] opening ${url}`);
+    logger.info?.(`[steamedclaw-match] opening ${url}`);
     const socket = new WebSocket(url, {
       headers: {
         Authorization: `Bearer ${creds.apiKey}`,
@@ -659,7 +661,7 @@ function makeMatchWsService(api) {
 
     socket.on('open', () => {
       reconnectAttempts = 0;
-      logger.info?.(`[steamedclaw-ws] connected match ${matchId}`);
+      logger.info?.(`[steamedclaw-match] connected match ${matchId}`);
     });
 
     socket.on('message', (raw) => {
@@ -671,7 +673,7 @@ function makeMatchWsService(api) {
       }
       const type = msg?.type;
       if (type === 'connected') {
-        logger.info?.(`[steamedclaw-ws] handshake ok match ${matchId}`);
+        logger.info?.(`[steamedclaw-match] handshake ok match ${matchId}`);
         return;
       }
       if (type === 'your_turn') {
@@ -681,7 +683,7 @@ function makeMatchWsService(api) {
           activeMatchForSeq = matchId;
         }
         if (seq <= lastSeq) {
-          logger.info?.(`[steamedclaw-ws] your_turn seq ${seq} <= lastSeq ${lastSeq}, ignoring`);
+          logger.info?.(`[steamedclaw-match] your_turn seq ${seq} <= lastSeq ${lastSeq}, ignoring`);
           return;
         }
         lastSeq = seq;
@@ -720,7 +722,7 @@ function makeMatchWsService(api) {
         return;
       }
       if (type === 'error') {
-        logger.warn?.(`[steamedclaw-ws] server error match ${matchId}: ${JSON.stringify(msg)}`);
+        logger.warn?.(`[steamedclaw-match] server error match ${matchId}: ${JSON.stringify(msg)}`);
         resolvePendingTakeTurn({
           ok: false,
           error: typeof msg.error === 'string' ? msg.error : 'server_error',
@@ -733,7 +735,7 @@ function makeMatchWsService(api) {
 
     socket.on('close', (code, reason) => {
       logger.info?.(
-        `[steamedclaw-ws] closed match ${matchId} code=${code} reason=${reason?.toString?.('utf8') || ''}`,
+        `[steamedclaw-match] closed match ${matchId} code=${code} reason=${reason?.toString?.('utf8') || ''}`,
       );
       if (!stopped && currentMatchId === matchId && code !== 1000) {
         scheduleReconnect(matchId, creds);
@@ -741,7 +743,7 @@ function makeMatchWsService(api) {
     });
 
     socket.on('error', (err) => {
-      logger.warn?.(`[steamedclaw-ws] ws error match ${matchId}: ${err.message}`);
+      logger.warn?.(`[steamedclaw-match] ws error match ${matchId}: ${err.message}`);
     });
   }
 
@@ -854,16 +856,16 @@ function makeMatchWsService(api) {
   }
 
   return {
-    id: 'steamedclaw-ws-match-service',
+    id: 'steamedclaw-match-service',
     async start() {
-      logger.info?.(`[steamedclaw-ws] service starting (mode=${api.registrationMode})`);
+      logger.info?.(`[steamedclaw-match] service starting (mode=${api.registrationMode})`);
       const creds = readCredentials();
       if (!creds) {
-        logger.info?.('[steamedclaw-ws] no credentials yet; waiting for register_agent');
+        logger.info?.('[steamedclaw-match] no credentials yet; waiting for register_agent');
       }
       await tick();
       poller = setInterval(() => {
-        void tick().catch((e) => logger.warn?.(`[steamedclaw-ws] tick error: ${e.message}`));
+        void tick().catch((e) => logger.warn?.(`[steamedclaw-match] tick error: ${e.message}`));
       }, MATCH_POLL_MS);
     },
     async stop() {
@@ -878,7 +880,7 @@ function makeMatchWsService(api) {
           // ignore
         }
       }
-      logger.info?.('[steamedclaw-ws] service stopped');
+      logger.info?.('[steamedclaw-match] service stopped');
     },
     // Called by the register_agent tool after credentials.md is written.
     // Drives a tick so match-ws picks up any current match — idempotent
@@ -1142,9 +1144,9 @@ function makeAgentWsService(api, matchSvc, pollSvc) {
   function wakeAgent(reason) {
     try {
       api.runtime.system.requestHeartbeatNow();
-      logger.info?.(`[steamedclaw-agent-ws] requested heartbeat wake (${reason})`);
+      logger.info?.(`[steamedclaw-agent] requested heartbeat wake (${reason})`);
     } catch (err) {
-      logger.warn?.(`[steamedclaw-agent-ws] requestHeartbeatNow failed: ${err.message}`);
+      logger.warn?.(`[steamedclaw-agent] requestHeartbeatNow failed: ${err.message}`);
     }
   }
 
@@ -1165,13 +1167,13 @@ function makeAgentWsService(api, matchSvc, pollSvc) {
     const gameId = typeof msg.gameId === 'string' ? msg.gameId : null;
     if (!matchId || !gameId) {
       logger.warn?.(
-        `[steamedclaw-agent-ws] match_found missing matchId/gameId: ${JSON.stringify(msg)}`,
+        `[steamedclaw-agent] match_found missing matchId/gameId: ${JSON.stringify(msg)}`,
       );
       return;
     }
     const existing = readCurrentMatch();
     if (existing && existing.matchId === matchId) {
-      logger.info?.(`[steamedclaw-agent-ws] match_found ${matchId} already active, no-op`);
+      logger.info?.(`[steamedclaw-agent] match_found ${matchId} already active, no-op`);
       // Pending marker is stale by definition once we're matched — the
       // poll-path idempotency guard relies on it being cleared.
       clearPendingQueue();
@@ -1179,18 +1181,18 @@ function makeAgentWsService(api, matchSvc, pollSvc) {
     }
     if (existing && existing.matchId !== matchId) {
       logger.warn?.(
-        `[steamedclaw-agent-ws] overriding stale current-game.md matchId=${existing.matchId} → ${matchId}`,
+        `[steamedclaw-agent] overriding stale current-game.md matchId=${existing.matchId} → ${matchId}`,
       );
     }
     writeCurrentMatch(matchId, gameId, 0);
     clearPendingQueue();
-    logger.info?.(`[steamedclaw-agent-ws] match_found matchId=${matchId} game=${gameId}`);
+    logger.info?.(`[steamedclaw-agent] match_found matchId=${matchId} game=${gameId}`);
     wakeAgent(`match_found ${gameId}`);
     if (matchSvc) {
       matchSvc
         .onMatchFoundExternal()
         .catch((err) =>
-          logger.warn?.(`[steamedclaw-agent-ws] onMatchFoundExternal failed: ${err.message}`),
+          logger.warn?.(`[steamedclaw-agent] onMatchFoundExternal failed: ${err.message}`),
         );
     }
   }
@@ -1199,7 +1201,7 @@ function makeAgentWsService(api, matchSvc, pollSvc) {
     if (stopped) return;
     currentServer = creds.server;
     const url = httpToAgentWsUrl(creds.server);
-    logger.info?.(`[steamedclaw-agent-ws] opening ${url}`);
+    logger.info?.(`[steamedclaw-agent] opening ${url}`);
     const socket = new WebSocket(url, {
       headers: {
         Authorization: `Bearer ${creds.apiKey}`,
@@ -1231,7 +1233,7 @@ function makeAgentWsService(api, matchSvc, pollSvc) {
     socket.on('unexpected-response', (_req, res) => {
       if (!capabilityLoggedMissing) {
         logger.info?.(
-          `[steamedclaw-agent-ws] upgrade rejected status=${res.statusCode} — /ws/agent may be disabled; falling back to poll`,
+          `[steamedclaw-agent] upgrade rejected status=${res.statusCode} — /ws/agent may be disabled; falling back to poll`,
         );
         capabilityLoggedMissing = true;
       }
@@ -1249,7 +1251,7 @@ function makeAgentWsService(api, matchSvc, pollSvc) {
       }
       const type = msg?.type;
       if (type === 'connected') {
-        logger.info?.(`[steamedclaw-agent-ws] handshake ok agent=${msg.agentId}`);
+        logger.info?.(`[steamedclaw-agent] handshake ok agent=${msg.agentId}`);
         return;
       }
       if (type === 'match_found') {
@@ -1257,11 +1259,11 @@ function makeAgentWsService(api, matchSvc, pollSvc) {
         return;
       }
       if (type === 'replaced') {
-        logger.info?.(`[steamedclaw-agent-ws] replaced by newer connection`);
+        logger.info?.(`[steamedclaw-agent] replaced by newer connection`);
         return;
       }
       if (type === 'error') {
-        logger.warn?.(`[steamedclaw-agent-ws] server error: ${JSON.stringify(msg)}`);
+        logger.warn?.(`[steamedclaw-agent] server error: ${JSON.stringify(msg)}`);
         return;
       }
     });
@@ -1280,23 +1282,23 @@ function makeAgentWsService(api, matchSvc, pollSvc) {
     });
 
     socket.on('error', (err) => {
-      logger.warn?.(`[steamedclaw-agent-ws] ws error: ${err.message}`);
+      logger.warn?.(`[steamedclaw-agent] ws error: ${err.message}`);
     });
   }
 
   return {
-    id: 'steamedclaw-agent-ws-service',
+    id: 'steamedclaw-agent-service',
     async start() {
       if (api.registrationMode !== 'full') {
         logger.info?.(
-          `[steamedclaw-agent-ws] skipped (mode=${api.registrationMode}); waiting for full registration`,
+          `[steamedclaw-agent] skipped (mode=${api.registrationMode}); waiting for full registration`,
         );
         return;
       }
       const creds = readCredentials();
       if (!creds) {
         logger.info?.(
-          '[steamedclaw-agent-ws] no credentials yet; waiting for register_agent to open /ws/agent',
+          '[steamedclaw-agent] no credentials yet; waiting for register_agent to open /ws/agent',
         );
         return;
       }
@@ -1313,7 +1315,7 @@ function makeAgentWsService(api, matchSvc, pollSvc) {
           // ignore
         }
       }
-      logger.info?.('[steamedclaw-agent-ws] service stopped');
+      logger.info?.('[steamedclaw-agent] service stopped');
     },
     // Called by the register_agent tool after credentials.md is written.
     // Opens /ws/agent so the newly-registered agent starts receiving
@@ -1337,10 +1339,10 @@ function makeAgentWsService(api, matchSvc, pollSvc) {
 // ──────────────────────────────────────────────────────────────────────
 
 export default definePluginEntry({
-  id: 'steamedclaw-ws',
-  name: 'SteamedClaw WS',
+  id: 'steamedclaw-plugin',
+  name: 'SteamedClaw',
   description:
-    'register_agent + queue_match + get_turn + take_turn + get_rules + get_strategy tools backed by /ws/agent and /ws/game push sockets (Path 3).',
+    'register_agent + queue_match + get_turn + take_turn + get_rules + get_strategy tools backed by /ws/agent and /ws/game push sockets.',
   configSchema: {
     type: 'object',
     additionalProperties: false,
@@ -1597,7 +1599,7 @@ export default definePluginEntry({
       api.registerService(pollSvc);
     } else {
       api.logger.info?.(
-        `[steamedclaw-ws] services NOT registered (mode=${api.registrationMode}); tools still available`,
+        `[steamedclaw-match] services NOT registered (mode=${api.registrationMode}); tools still available`,
       );
     }
   },
