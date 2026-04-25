@@ -60,7 +60,7 @@ const QUEUE_POLL_MS = 30000;
 
 // Distinctive UA so server-side analysis can classify plugin-origin
 // traffic. Bumped alongside package.json.
-const PLUGIN_USER_AGENT = 'steamedclaw-plugin/0.9.11';
+const PLUGIN_USER_AGENT = 'steamedclaw-plugin/0.9.12';
 
 // Match lanes. PLUGIN_LANES mirrors LANES from @botoff/shared
 // (packages/shared/src/schemas/api.ts); the plugin ships standalone and
@@ -293,7 +293,7 @@ function makeRegisterAgent(api, matchSvc, agentSvc, pollSvc) {
         ok: false,
         error: 'config_error',
         message:
-          'Plugin config missing "server". Ask the operator to set plugins.steamedclaw-plugin.server in openclaw.json.',
+          'Plugin config missing "server". Ask the operator to set plugins.entries.steamedclaw-plugin.config.server in openclaw.json.',
       };
     }
     inFlight = (async () => {
