@@ -60,7 +60,7 @@ const QUEUE_POLL_MS = 30000;
 
 // Distinctive UA so server-side analysis can classify plugin-origin
 // traffic. Bumped alongside package.json.
-const PLUGIN_USER_AGENT = 'steamedclaw-plugin/0.9.12';
+const PLUGIN_USER_AGENT = 'steamedclaw-plugin/0.9.14';
 
 // Match lanes. PLUGIN_LANES mirrors LANES from @botoff/shared
 // (packages/shared/src/schemas/api.ts); the plugin ships standalone and
@@ -85,6 +85,16 @@ export const PLUGIN_DEFAULT_LANE = 'fast';
 // spurious `timeout` error while the match is still live. 8 min buys a
 // little slop on top of the 7-min server timeout.
 const TAKE_TURN_TIMEOUT_MS = 480000;
+
+// Response-body status values that mean "the match has ended". The
+// server normalizes terminal DB states (completed, aborted) to a single
+// response status `game_over` in buildStateResponse / buildGameOverResponse
+// (packages/server/src/app.ts). When get_turn's HTTP fallback sees this
+// the plugin clears current-game.md and surfaces the same
+// `no_active_match` shape used when no match is set locally — without
+// it, an LLM seeing `myTurn:false` plus `status:game_over` could
+// mistake it for "opponent's turn" and loop on a dead match (#396).
+const TERMINAL_MATCH_STATUSES = new Set(['game_over']);
 
 // /ws/agent socket lifetime constants (issue #346).
 const AGENT_WS_RECONNECT_BASE_MS = 1000;
@@ -473,7 +483,8 @@ async function queueMatch(gameId, lane, pollSvc) {
 // get_turn / take_turn tool implementations
 // ──────────────────────────────────────────────────────────────────────
 
-async function getTurn(matchSvc) {
+async function getTurn(matchSvc, opts = {}) {
+  const refresh = opts.refresh === true;
   const creds = readCredentials();
   if (!creds) {
     // get_turn historically used `status: 'not_registered'`; retain the
@@ -485,27 +496,67 @@ async function getTurn(matchSvc) {
   if (!match) {
     return { status: 'no_active_match', message: 'Call queue_match to play.' };
   }
-  const cached = matchSvc ? matchSvc.getCachedTurn(match.matchId) : null;
-  if (cached) {
-    return {
-      status: 'your_turn',
-      matchId: match.matchId,
-      game: match.game,
-      sequence: cached.sequence,
-      view: cached.view,
-      myTurn: true,
-    };
+  if (!refresh) {
+    const cached = matchSvc ? matchSvc.getCachedTurn(match.matchId) : null;
+    if (cached) {
+      return {
+        status: 'your_turn',
+        matchId: match.matchId,
+        game: match.game,
+        sequence: cached.sequence,
+        view: cached.view,
+        myTurn: true,
+      };
+    }
+  } else if (matchSvc) {
+    // Explicit refresh — drop any cached `your_turn` before falling
+    // through. A subsequent take_turn would otherwise replay the same
+    // stale view that motivated the refresh in the first place (#396).
+    matchSvc.invalidateCachedTurn(match.matchId);
   }
   // Rare path — no `your_turn` push has landed yet (plugin just started
-  // mid-match, or the match WS is still reconnecting). One HTTP GET to
+  // mid-match, the match WS is still reconnecting), or the LLM passed
+  // {refresh:true} to escape a stale cache (#396). One HTTP GET to
   // surface whatever the server thinks this agent's state is.
   const url = `${creds.server}/api/matches/${match.matchId}/state?wait=false`;
   const res = await httpRequest('GET', url, creds.apiKey, null);
+  // 404 + match_not_found means the server has no record of this match
+  // (ended silently, expired, or never existed). Clear local state and
+  // surface the terminal shape so the LLM doesn't loop on a dead match.
+  if (
+    res.status === 404 &&
+    typeof res.data?.error === 'string' &&
+    res.data.error === 'match_not_found'
+  ) {
+    if (matchSvc) matchSvc.invalidateCachedTurn(match.matchId);
+    clearCurrentMatch();
+    return {
+      status: 'no_active_match',
+      matchId: match.matchId,
+      message: 'Match has ended on the server. Call queue_match to start a new game.',
+      fetchedVia: 'http',
+    };
+  }
   if (res.status !== 200) {
     const err = typeof res.data?.error === 'string' ? res.data.error : 'state_failed';
     return { status: 'error', error: err, httpStatus: res.status };
   }
   const body = res.data ?? {};
+  // Terminal server status — the match has ended; clear local state and
+  // return `no_active_match` (the same shape the no-match path uses) so
+  // the LLM doesn't get a `myTurn:false`/`completed` mix that's easy to
+  // mistake for "opponent's turn" (#396).
+  if (typeof body.status === 'string' && TERMINAL_MATCH_STATUSES.has(body.status)) {
+    if (matchSvc) matchSvc.invalidateCachedTurn(match.matchId);
+    clearCurrentMatch();
+    return {
+      status: 'no_active_match',
+      matchId: body.matchId ?? match.matchId,
+      game: body.gameId ?? match.game,
+      message: `Match ${body.status} on the server. Call queue_match to start a new game.`,
+      fetchedVia: 'http',
+    };
+  }
   // If the server reports it is our turn, prime the match service's
   // cache so a follow-up take_turn resolves a sequence instead of
   // failing with no_turn_cached while the match WS is still opening
@@ -722,13 +773,51 @@ function makeMatchWsService(api) {
         return;
       }
       if (type === 'error') {
+        const errorCode = typeof msg.error === 'string' ? msg.error : 'server_error';
+        // not_your_turn means the server has advanced state without a
+        // push this agent observed (turn-timeout forfeit, opponent moved
+        // while we were stuck, or the match ended silently). The cached
+        // `your_turn` payload is stale by definition — invalidate it so
+        // the LLM's next get_turn falls through to HTTP and surfaces
+        // fresh state instead of replaying the same dead view. Reset
+        // lastSeq too so a subsequent prime or push at the prior
+        // sequence isn't swallowed by the stale-seq guard (#396).
+        if (errorCode === 'not_your_turn') {
+          // Cache is known stale — the server has advanced past our
+          // current view. Drop it so the LLM's next get_turn falls
+          // through to HTTP. lastSeq is intentionally NOT reset:
+          // the server only pushes monotonically-newer sequences,
+          // and weakening the stale-seq guard could let a re-emitted
+          // old push (e.g. on a match-WS reconnect) overwrite the
+          // freshly-primed cache.
+          invalidateCachedTurn(matchId);
+          logger.info?.(
+            `[steamedclaw-match] not_your_turn — invalidated cached turn for ${matchId}`,
+          );
+          resolvePendingTakeTurn({
+            ok: false,
+            error: errorCode,
+            details:
+              'Server advanced state without a push this agent observed. Cache cleared — call get_turn (or get_turn({refresh: true})) to fetch fresh state before retrying.',
+            currentSequence: msg.currentSequence,
+          });
+          return;
+        }
         logger.warn?.(`[steamedclaw-match] server error match ${matchId}: ${JSON.stringify(msg)}`);
-        resolvePendingTakeTurn({
+        const errorResult = {
           ok: false,
-          error: typeof msg.error === 'string' ? msg.error : 'server_error',
+          error: errorCode,
           details: msg.details,
           currentSequence: msg.currentSequence,
-        });
+        };
+        // Hint LLMs at get_rules so minimal SOULs have a recovery path (#397).
+        if (errorCode === 'invalid_action') {
+          const game = readCurrentMatch()?.game;
+          errorResult.hint = game
+            ? `Action shape rejected. Check the ${game} rules for the valid action schema (call get_rules({gameId: "${game}"}) if you don't already have them).`
+            : `Action shape rejected. Call get_rules({gameId}) for the current game's action schema.`;
+        }
+        resolvePendingTakeTurn(errorResult);
         return;
       }
     });
@@ -807,6 +896,18 @@ function makeMatchWsService(api) {
     const game = readCurrentMatch()?.game || 'unknown';
     writeCurrentMatch(matchId, game, sequence);
     cachedTurn = { matchId, game, sequence, view, cachedAt: Date.now() };
+  }
+
+  // Inverse of primeCachedTurn — drops the cached `your_turn` payload
+  // so a follow-up get_turn falls through to HTTP. Called after a
+  // `not_your_turn` server reply (cache is known stale) or from get_turn
+  // when the LLM passes {refresh: true}. matchId is optional; pass it
+  // to invalidate only when the cache belongs to a specific match
+  // (avoids clobbering after a fast match-change race) (#396).
+  function invalidateCachedTurn(matchId) {
+    if (!cachedTurn) return;
+    if (matchId && cachedTurn.matchId !== matchId) return;
+    cachedTurn = null;
   }
 
   function submitAction(matchId, action, timeoutMs) {
@@ -892,6 +993,7 @@ function makeMatchWsService(api) {
     },
     getCachedTurn,
     primeCachedTurn,
+    invalidateCachedTurn,
     submitAction,
     isSocketOpenFor,
     onMatchFoundExternal,
@@ -1467,15 +1569,22 @@ export default definePluginEntry({
     api.registerTool({
       name: 'get_turn',
       description:
-        "Read the current turn state for your active match. No arguments. Returns {status, matchId?, game?, sequence?, view?, myTurn?, fetchedVia?, message?, error?, httpStatus?}. The happy path hits the plugin's cache of the last `your_turn` push and returns immediately — no outbound request. If no push has landed yet (plugin just restarted mid-match or the match WS is still reconnecting), falls back to a single GET /api/matches/:id/state?wait=false and marks fetchedVia:'http' so you can tell. status='no_active_match' means you haven't queued yet — call queue_match first. status='not_registered' means no credentials — call register_agent({name}) first.",
+        "Read the current turn state for your active match. Pass {refresh?: true} to bypass the cache and force a fresh fetch from the server — use this if take_turn just returned not_your_turn (the cache may be stale because the server advanced state without notifying this agent). Returns {status, matchId?, game?, sequence?, view?, myTurn?, fetchedVia?, message?, error?, httpStatus?}. The default (no refresh) hot path hits the plugin's cache of the last `your_turn` push and returns immediately — no outbound request. With refresh:true (or when no push has landed yet) the plugin issues GET /api/matches/:id/state?wait=false and marks fetchedVia:'http'. status='no_active_match' means there is no live match — either you haven't queued yet OR the server has ended the match (call queue_match to start a new one). status='not_registered' means no credentials — call register_agent({name}) first.",
       parameters: {
         type: 'object',
-        properties: {},
+        properties: {
+          refresh: {
+            type: 'boolean',
+            description:
+              'Optional. If true, bypass the plugin cache and fetch fresh state from the server. Use this after take_turn returns not_your_turn — the cached `your_turn` payload is stale and will keep returning isYourTurn:true forever otherwise.',
+          },
+        },
         additionalProperties: false,
       },
-      async execute() {
+      async execute(_toolCallId, args) {
         try {
-          const payload = await getTurn(matchSvc);
+          const refresh = args?.refresh === true;
+          const payload = await getTurn(matchSvc, { refresh });
           return { content: [{ type: 'text', text: JSON.stringify(payload) }] };
         } catch (err) {
           return {
@@ -1562,7 +1671,7 @@ export default definePluginEntry({
     api.registerTool({
       name: 'take_turn',
       description:
-        "Submit a move for your active match over the open game WebSocket. Pass {action: <move>} where the move shape is game-specific (e.g. {type:'move', position:4} for tic-tac-toe, {type:'take', pile, count} for nim, {type:'drop', column} for four-in-a-row). Returns {ok, gameOver?, matchStatus?, newSequence?, view?, results?, error?, details?, currentSequence?}. On ok:true gameOver:false the server sent your_turn again — use the new view for the next decision. On ok:true gameOver:true the match ended; `results` carries the outcome. On error='ws_not_ready' the match WS isn't open yet — wait a moment (the plugin will reconnect) and retry. On error='stale_sequence' a newer your_turn already arrived; call get_turn to refresh and retry. On error='timeout' nothing was received for ~8 min — the match may still be live; call get_turn to re-check and only retry if myTurn is still true. On error='not_registered' no credentials are present — call register_agent({name}) first.",
+        "Submit a move for your active match over the open game WebSocket. Pass {action: <move>} where the move shape is game-specific (e.g. {type:'move', position:4} for tic-tac-toe, {type:'take', pile, count} for nim, {type:'drop', column} for four-in-a-row). Returns {ok, gameOver?, matchStatus?, newSequence?, view?, results?, error?, details?, currentSequence?, hint?}. On ok:true gameOver:false the server sent your_turn again — use the new view for the next decision. On ok:true gameOver:true the match ended; `results` carries the outcome. On error='ws_not_ready' the match WS isn't open yet — wait a moment (the plugin will reconnect) and retry. On error='stale_sequence' a newer your_turn already arrived; call get_turn to refresh and retry. On error='invalid_action' the move shape didn't match the game's action schema; the response includes a `hint` field pointing at get_rules — fetch the rules and retry with a conformant action. On error='not_your_turn' the server has advanced state without a push this agent observed (the previous turn timed out, the opponent moved, or the match has ended). The plugin clears its stale cache automatically; call get_turn({refresh: true}) to fetch fresh state and decide what to do (it may be the opponent's turn or the match may have ended). Do NOT loop on take_turn after this error — every retry will return the same not_your_turn until you refresh. On error='timeout' nothing was received for ~8 min — the match may still be live; call get_turn to re-check and only retry if myTurn is still true. On error='not_registered' no credentials are present — call register_agent({name}) first.",
       parameters: {
         type: 'object',
         properties: {
