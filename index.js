@@ -8,7 +8,7 @@
 //     `match_found` pushes server-side so the agent learns about freshly
 //     paired matches without polling.
 //
-// The plugin also exposes six LLM-visible tools:
+// The plugin also exposes seven LLM-visible tools:
 //   * `register_agent({name, model?})` — POST /api/agents on first boot
 //     when no credentials exist. LLM supplies name from its SOUL.
 //   * `queue_match({gameId})` — HTTP POST to /api/matchmaking/queue.
@@ -26,6 +26,11 @@
 //     returns opinionated human-curated hints. Explicitly opt-in —
 //     rules + view are sufficient to play and strong models may have
 //     better strategy internalized already.
+//   * `leave_queue()` — sets an in-memory pause flag that suppresses
+//     `requestHeartbeatNow` on subsequent `match_found` pushes (and on
+//     the matched-poll fallback). Active matches keep waking on
+//     `your_turn`; only future queue → match cycles are suppressed.
+//     `queue_match` clears the flag and resumes — no separate resume tool.
 //
 // See `botoff/CLAUDE.md` § Play Paths for the three-path model.
 
@@ -60,7 +65,7 @@ const QUEUE_POLL_MS = 30000;
 
 // Distinctive UA so server-side analysis can classify plugin-origin
 // traffic. Bumped alongside package.json.
-const PLUGIN_USER_AGENT = 'steamedclaw-plugin/0.9.14';
+const PLUGIN_USER_AGENT = 'steamedclaw-plugin/0.9.15';
 
 // Match lanes. PLUGIN_LANES mirrors LANES from @botoff/shared
 // (packages/shared/src/schemas/api.ts); the plugin ships standalone and
@@ -433,7 +438,11 @@ function makeRegisterAgent(api, matchSvc, agentSvc, pollSvc) {
 // queue_match tool implementation
 // ──────────────────────────────────────────────────────────────────────
 
-async function queueMatch(gameId, lane, pollSvc) {
+async function queueMatch(gameId, lane, pollSvc, queueState) {
+  // Symmetric resume — calling queue_match always clears any leave_queue
+  // pause, regardless of whether this attempt succeeds. Idempotent in the
+  // not-paused case. (#399)
+  if (queueState) queueState.paused = false;
   const creds = readCredentials();
   if (!creds) {
     return { ok: false, error: 'not_registered', message: NOT_REGISTERED_MESSAGE };
@@ -638,6 +647,28 @@ async function getStrategy(gameId) {
     version: typeof body.version === 'string' ? body.version : '',
     content: typeof body.content === 'string' ? body.content : '',
   };
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// leave_queue tool implementation (#399)
+// ──────────────────────────────────────────────────────────────────────
+
+// Pause matchmaking from the agent's side. Sets an in-memory flag
+// consulted by the match_found push handler (and the matched-poll
+// fallback) so the plugin stops waking the heartbeat on new pairings.
+// Active matches are unaffected — `your_turn` wakes are not gated, so
+// any in-flight match plays out to game_over normally.
+//
+// Persistence: in-memory only. An operator restart resets to accepting;
+// the agent (or operator via chat) re-issues leave_queue if the paused
+// posture should resume after a restart. Cross-restart pause isn't a
+// real use case — the operator who restarts has direct chat access.
+function leaveQueue(queueState) {
+  if (queueState.paused) {
+    return { ok: true, status: 'already_paused' };
+  }
+  queueState.paused = true;
+  return { ok: true, status: 'queue_paused' };
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1022,7 +1053,7 @@ function makeMatchWsService(api) {
  * when WS is unavailable. We keep QUEUE_POLL_MS at 30 s as a ceiling,
  * not a floor (#385).
  */
-function makeQueuePollService(api, matchSvc) {
+function makeQueuePollService(api, matchSvc, queueState) {
   const logger = api.logger;
 
   let stopped = false;
@@ -1119,7 +1150,16 @@ function makeQueuePollService(api, matchSvc) {
             `[steamedclaw-queue-poll] status=matched matchId=${body.matchId} game=${pending.gameId}`,
           );
           writeCurrentMatch(body.matchId, pending.gameId, 0);
-          wakeAgent(`poll match_found ${pending.gameId}`);
+          // Gate the heartbeat wake (not wakeAgent's body) so leave_queue
+          // suppresses the LLM cycle entirely. Matched local state still
+          // gets recorded — the pause only stops the wake. (#399)
+          if (queueState && queueState.paused) {
+            logger.info?.(
+              `[steamedclaw-queue-poll] poll match_found ${pending.gameId} heartbeat wake suppressed — queue paused (leave_queue active)`,
+            );
+          } else {
+            wakeAgent(`poll match_found ${pending.gameId}`);
+          }
           if (matchSvc) {
             matchSvc
               .onMatchFoundExternal()
@@ -1230,7 +1270,7 @@ function httpToAgentWsUrl(serverUrl) {
  * the LLM wakes, and triggers matchSvc.onMatchFoundExternal() so the
  * match-WS socket opens immediately — not on the next 5-s tick (#367).
  */
-function makeAgentWsService(api, matchSvc, pollSvc) {
+function makeAgentWsService(api, matchSvc, pollSvc, queueState) {
   const logger = api.logger;
 
   let stopped = false;
@@ -1289,7 +1329,20 @@ function makeAgentWsService(api, matchSvc, pollSvc) {
     writeCurrentMatch(matchId, gameId, 0);
     clearPendingQueue();
     logger.info?.(`[steamedclaw-agent] match_found matchId=${matchId} game=${gameId}`);
-    wakeAgent(`match_found ${gameId}`);
+    // Gate the heartbeat wake (not wakeAgent's body) so leave_queue
+    // suppresses the LLM cycle entirely. Suppressing inside wakeAgent
+    // would still cost an LLM heartbeat; the gate must be before the
+    // call. The match WS still opens (onMatchFoundExternal below) — if a
+    // stale queue produces a pairing, the resulting `your_turn` push will
+    // wake the agent on the active match WS, and they'll play that one
+    // match. The pause is fully effective from the next queue cycle. (#399)
+    if (queueState && queueState.paused) {
+      logger.info?.(
+        `[steamedclaw-agent] match_found ${gameId} heartbeat wake suppressed — queue paused (leave_queue active)`,
+      );
+    } else {
+      wakeAgent(`match_found ${gameId}`);
+    }
     if (matchSvc) {
       matchSvc
         .onMatchFoundExternal()
@@ -1444,7 +1497,7 @@ export default definePluginEntry({
   id: 'steamedclaw-plugin',
   name: 'SteamedClaw',
   description:
-    'register_agent + queue_match + get_turn + take_turn + get_rules + get_strategy tools backed by /ws/agent and /ws/game push sockets.',
+    'register_agent + queue_match + leave_queue + get_turn + take_turn + get_rules + get_strategy tools backed by /ws/agent and /ws/game push sockets.',
   configSchema: {
     type: 'object',
     additionalProperties: false,
@@ -1455,6 +1508,11 @@ export default definePluginEntry({
   },
   register(api) {
     const cfg = api.pluginConfig ?? {};
+    // In-memory pause flag for leave_queue (#399). Closure-scoped so the
+    // queue-tool handlers and the two services share a single source of
+    // truth without a module-level singleton. Resets to false on plugin
+    // reload — cross-restart pause is not a target use case.
+    const queueState = { paused: false };
     // The match service owns the cached `your_turn` payload and the
     // single-slot ack for take_turn, so we build it once here and let
     // both tools call into the same instance. In non-full mode (no
@@ -1467,8 +1525,8 @@ export default definePluginEntry({
     // registration (start/stop lifecycle) is gated on full mode + agent-ws
     // below; the poll's scheduleNextTick still works via notifyMarkerWritten
     // in agent-ws-disabled mode so queued→matched recovery is never lost.
-    const pollSvc = makeQueuePollService(api, matchSvc);
-    const agentSvc = makeAgentWsService(api, matchSvc, pollSvc);
+    const pollSvc = makeQueuePollService(api, matchSvc, queueState);
+    const agentSvc = makeAgentWsService(api, matchSvc, pollSvc, queueState);
     const registerAgent = makeRegisterAgent(api, matchSvc, agentSvc, pollSvc);
 
     api.registerTool({
@@ -1550,7 +1608,7 @@ export default definePluginEntry({
             };
           }
           const resolvedLane = lane ?? cfg.defaultLane ?? PLUGIN_DEFAULT_LANE;
-          const payload = await queueMatch(gameId, resolvedLane, pollSvc);
+          const payload = await queueMatch(gameId, resolvedLane, pollSvc, queueState);
           return { content: [{ type: 'text', text: JSON.stringify(payload) }] };
         } catch (err) {
           return {
@@ -1687,6 +1745,33 @@ export default definePluginEntry({
       async execute(_toolCallId, { action }) {
         try {
           const payload = await takeTurn(matchSvc, action);
+          return { content: [{ type: 'text', text: JSON.stringify(payload) }] };
+        } catch (err) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({ ok: false, error: 'exception', message: err.message }),
+              },
+            ],
+            isError: true,
+          };
+        }
+      },
+    });
+
+    api.registerTool({
+      name: 'leave_queue',
+      description:
+        "Pause matchmaking. Use when the operator asks you to stop playing for now, or when you decide on your own that you should stop for any reason. After this call, the plugin will not wake your heartbeat on new `match_found` events from the server — even if the server pairs you, you won't be woken to play. Already-active matches (a match in progress when you call this) keep waking you on each `your_turn` and play out to game_over normally; only future queue → match cycles are suppressed. The pause lives in plugin memory only — an operator container restart resets to accepting matches, so this is not a durable opt-out. Resume by calling `queue_match` again — that clears the pause flag and re-enters the queue normally; you do not need a separate resume call. Returns {ok:true, status:'queue_paused'} on the first call; {ok:true, status:'already_paused'} if you call it again while already paused (idempotent and safe).",
+      parameters: {
+        type: 'object',
+        properties: {},
+        additionalProperties: false,
+      },
+      async execute() {
+        try {
+          const payload = leaveQueue(queueState);
           return { content: [{ type: 'text', text: JSON.stringify(payload) }] };
         } catch (err) {
           return {
