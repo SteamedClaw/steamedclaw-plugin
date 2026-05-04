@@ -65,7 +65,7 @@ const QUEUE_POLL_MS = 30000;
 
 // Distinctive UA so server-side analysis can classify plugin-origin
 // traffic. Bumped alongside package.json.
-const PLUGIN_USER_AGENT = 'steamedclaw-plugin/0.9.15';
+const PLUGIN_USER_AGENT = 'steamedclaw-plugin/0.9.16';
 
 // Match lanes. PLUGIN_LANES mirrors LANES from @botoff/shared
 // (packages/shared/src/schemas/api.ts); the plugin ships standalone and
@@ -473,6 +473,17 @@ async function queueMatch(gameId, lane, pollSvc, queueState) {
     writeCurrentMatch(body.matchId, gameId, 0);
     clearPendingQueue();
     return { ok: true, status: 'matched', matchId: body.matchId, game: gameId };
+  }
+  // {status:'already_queued'} — duplicate POST while a prior queue entry is
+  // still live (#405). The pending-queue marker was written on the first
+  // queue_match; do NOT rewrite it (avoids churning the queuedAt timestamp).
+  if (body.status === 'already_queued') {
+    return {
+      ok: true,
+      status: 'already_queued',
+      game: gameId,
+      position: typeof body.position === 'number' ? body.position : undefined,
+    };
   }
   // {status:'queued'} — mark this agent as having an outstanding queue
   // so the poll fallback can recover pairing if /ws/agent is degraded
@@ -1571,7 +1582,7 @@ export default definePluginEntry({
     api.registerTool({
       name: 'queue_match',
       description:
-        "Queue for a SteamedClaw match on the given game. Pass {gameId, lane?} — gameId e.g. 'tic-tac-toe', 'nim', 'four-in-a-row'; optional lane is 'fast' (low-latency agents; tight timeouts) or 'standard' (heartbeat-paced agents; longer per-turn windows). Omit lane to use the plugin's configured defaultLane (default 'fast' — this plugin is WS push-driven so fast is the expected posture; owners with a heartbeat-paced runtime should set defaultLane 'standard' in plugin config). A per-call lane argument overrides the config default. Returns {ok, status, matchId?, game, position?, error?}. On status='matched' the plugin has already written the new matchId to local state — the match WS will wake you on `your_turn`. On status='queued' no pairing was available yet; the plugin is holding the queue-side /ws/agent socket open and will wake you when a match is found. Do NOT call queue_match again after a `queued` — repeat calls return error='already_in_match' once paired, and spamming creates queue churn. On error='game_not_found' (HTTP 404), the gameId is invalid — pick a supported game. On error='invalid_lane' the lane argument was not 'fast' or 'standard'. On error='not_registered' no credentials are present; call register_agent({name}) first.",
+        "Queue for a SteamedClaw match on the given game. Pass {gameId, lane?} — gameId e.g. 'tic-tac-toe', 'nim', 'four-in-a-row'; optional lane is 'fast' (low-latency agents; tight timeouts) or 'standard' (heartbeat-paced agents; longer per-turn windows). Omit lane to use the plugin's configured defaultLane (default 'fast' — this plugin is WS push-driven so fast is the expected posture; owners with a heartbeat-paced runtime should set defaultLane 'standard' in plugin config). A per-call lane argument overrides the config default. Returns {ok, status, matchId?, game, position?, error?}. On status='matched' the plugin has already written the new matchId to local state — the match WS will wake you on `your_turn`. On status='queued' no pairing was available yet; the plugin is holding the queue-side /ws/agent socket open and will wake you when a match is found. Do NOT call queue_match again after a `queued` — repeat calls return error='already_in_match' once paired, and spamming creates queue churn. If you do re-call while still queued (no match yet), the response is status='already_queued' (with position) — treat that as confirmation you're already in queue and just wait for the WS push or the queue-poll fallback to wake you. On error='game_not_found' (HTTP 404), the gameId is invalid — pick a supported game. On error='invalid_lane' the lane argument was not 'fast' or 'standard'. On error='not_registered' no credentials are present; call register_agent({name}) first.",
       parameters: {
         type: 'object',
         properties: {
