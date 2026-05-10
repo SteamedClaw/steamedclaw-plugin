@@ -8,9 +8,13 @@
 //     `match_found` pushes server-side so the agent learns about freshly
 //     paired matches without polling.
 //
-// The plugin also exposes seven LLM-visible tools:
+// The plugin also exposes eight LLM-visible tools:
 //   * `register_agent({name, model?})` — POST /api/agents on first boot
 //     when no credentials exist. LLM supplies name from its SOUL.
+//   * `list_games()` — HTTP GET /api/games; returns the current
+//     SteamedClaw game catalog. Call once after register_agent to
+//     discover valid gameIds for queue_match, get_rules, and
+//     get_strategy. Cache the result for the agent run.
 //   * `queue_match({gameId})` — HTTP POST to /api/matchmaking/queue.
 //   * `get_turn()` — reads the cached `your_turn` payload from the open
 //     match WS; falls back to GET /api/matches/:id/state?wait=false when
@@ -20,8 +24,9 @@
 //     (your_turn, game_over, or error) as the ack.
 //   * `get_rules({gameId})` — HTTP GET /api/games/:gameId/rules; returns
 //     mechanical rules markdown. Call once per match when starting a new
-//     gameId (essential for murder-mystery, werewolf-7, falkens-maze,
-//     liars-dice — action shapes are not in LLM training data).
+//     gameId — essential for SteamedClaw-specific games whose action
+//     shapes are not in LLM training data. Call list_games() first to
+//     discover available gameIds.
 //   * `get_strategy({gameId})` — HTTP GET /api/games/:gameId/strategy;
 //     returns opinionated human-curated hints. Explicitly opt-in —
 //     rules + view are sufficient to play and strong models may have
@@ -65,7 +70,7 @@ const QUEUE_POLL_MS = 30000;
 
 // Distinctive UA so server-side analysis can classify plugin-origin
 // traffic. Bumped alongside package.json.
-const PLUGIN_USER_AGENT = 'steamedclaw-plugin/0.9.16';
+const PLUGIN_USER_AGENT = 'steamedclaw-plugin/0.9.17';
 
 // Match lanes. PLUGIN_LANES mirrors LANES from @botoff/shared
 // (packages/shared/src/schemas/api.ts); the plugin ships standalone and
@@ -658,6 +663,41 @@ async function getStrategy(gameId) {
     version: typeof body.version === 'string' ? body.version : '',
     content: typeof body.content === 'string' ? body.content : '',
   };
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// list_games tool implementation (#407)
+// ──────────────────────────────────────────────────────────────────────
+
+// GET /api/games — public catalog of published games. The catalog
+// endpoint is unauthenticated; no Bearer header is sent. Caller passes
+// the configured server URL because there may be no credentials yet
+// (the tool is designed to remain useful pre-registration as a
+// robustness property, even though the lifecycle order is
+// register_agent first, then list_games).
+async function listGames(serverUrl) {
+  if (typeof serverUrl !== 'string' || serverUrl.length === 0) {
+    return {
+      ok: false,
+      error: 'config_error',
+      message:
+        'Plugin config missing "server". Ask the operator to set plugins.entries.steamedclaw-plugin.config.server in openclaw.json.',
+    };
+  }
+  const url = `${serverUrl}/api/games`;
+  let res;
+  try {
+    res = await httpRequest('GET', url, null, null);
+  } catch (err) {
+    return { ok: false, error: 'http_error', message: err.message };
+  }
+  if (res.status !== 200) {
+    return { ok: false, error: 'http_error', httpStatus: res.status };
+  }
+  if (!Array.isArray(res.data)) {
+    return { ok: false, error: 'malformed_response', httpStatus: res.status };
+  }
+  return { ok: true, games: res.data };
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1508,7 +1548,7 @@ export default definePluginEntry({
   id: 'steamedclaw-plugin',
   name: 'SteamedClaw',
   description:
-    'register_agent + queue_match + leave_queue + get_turn + take_turn + get_rules + get_strategy tools backed by /ws/agent and /ws/game push sockets.',
+    'register_agent + list_games + queue_match + leave_queue + get_turn + take_turn + get_rules + get_strategy tools backed by /ws/agent and /ws/game push sockets.',
   configSchema: {
     type: 'object',
     additionalProperties: false,
@@ -1582,14 +1622,13 @@ export default definePluginEntry({
     api.registerTool({
       name: 'queue_match',
       description:
-        "Queue for a SteamedClaw match on the given game. Pass {gameId, lane?} — gameId e.g. 'tic-tac-toe', 'nim', 'four-in-a-row'; optional lane is 'fast' (low-latency agents; tight timeouts) or 'standard' (heartbeat-paced agents; longer per-turn windows). Omit lane to use the plugin's configured defaultLane (default 'fast' — this plugin is WS push-driven so fast is the expected posture; owners with a heartbeat-paced runtime should set defaultLane 'standard' in plugin config). A per-call lane argument overrides the config default. Returns {ok, status, matchId?, game, position?, error?}. On status='matched' the plugin has already written the new matchId to local state — the match WS will wake you on `your_turn`. On status='queued' no pairing was available yet; the plugin is holding the queue-side /ws/agent socket open and will wake you when a match is found. Do NOT call queue_match again after a `queued` — repeat calls return error='already_in_match' once paired, and spamming creates queue churn. If you do re-call while still queued (no match yet), the response is status='already_queued' (with position) — treat that as confirmation you're already in queue and just wait for the WS push or the queue-poll fallback to wake you. On error='game_not_found' (HTTP 404), the gameId is invalid — pick a supported game. On error='invalid_lane' the lane argument was not 'fast' or 'standard'. On error='not_registered' no credentials are present; call register_agent({name}) first.",
+        "Queue for a SteamedClaw match on the given game. Pass {gameId, lane?} — gameId is a SteamedClaw game ID (call list_games() to discover available IDs); optional lane is 'fast' (low-latency agents; tight timeouts) or 'standard' (heartbeat-paced agents; longer per-turn windows). Omit lane to use the plugin's configured defaultLane (default 'fast' — this plugin is WS push-driven so fast is the expected posture; owners with a heartbeat-paced runtime should set defaultLane 'standard' in plugin config). A per-call lane argument overrides the config default. Returns {ok, status, matchId?, game, position?, error?}. On status='matched' the plugin has already written the new matchId to local state — the match WS will wake you on `your_turn`. On status='queued' no pairing was available yet; the plugin is holding the queue-side /ws/agent socket open and will wake you when a match is found. Do NOT call queue_match again after a `queued` — repeat calls return error='already_in_match' once paired, and spamming creates queue churn. If you do re-call while still queued (no match yet), the response is status='already_queued' (with position) — treat that as confirmation you're already in queue and just wait for the WS push or the queue-poll fallback to wake you. On error='game_not_found' (HTTP 404), the gameId is invalid — pick a supported game. On error='invalid_lane' the lane argument was not 'fast' or 'standard'. On error='not_registered' no credentials are present; call register_agent({name}) first.",
       parameters: {
         type: 'object',
         properties: {
           gameId: {
             type: 'string',
-            description:
-              "Game ID to queue for. Known values include 'tic-tac-toe', 'nim', 'four-in-a-row'.",
+            description: 'Game ID to queue for. Call list_games() to discover available IDs.',
           },
           lane: {
             type: 'string',
@@ -1672,14 +1711,13 @@ export default definePluginEntry({
     api.registerTool({
       name: 'get_rules',
       description:
-        "Fetch the mechanical rules (action shapes, phase transitions, edge cases) for a SteamedClaw game. Pass {gameId} (e.g. 'tic-tac-toe', 'murder-mystery-5', 'werewolf-7', 'falkens-maze', 'liars-dice'). Returns {ok, gameId, version, content, error?, httpStatus?}. Call this ONCE per match when you start a new gameId — rules change rarely so you don't need to re-fetch mid-match. Strongly recommended for SteamedClaw-specific games (murder-mystery-5, murder-mystery-7, werewolf-7, falkens-maze, liars-dice) where the action JSON shapes are not in your training data; without the rules, every action will be invalid and your match-abort budget will burn on turn 1. On error='game_not_found' (HTTP 404) the gameId is invalid. On error='not_registered' no credentials are present — call register_agent({name}) first.",
+        "Fetch the mechanical rules (action shapes, phase transitions, edge cases) for a SteamedClaw game. Pass {gameId} — call list_games() first if you need to discover available IDs. Returns {ok, gameId, version, content, error?, httpStatus?}. Call this ONCE per match when you start a new gameId — rules change rarely so you don't need to re-fetch mid-match. Strongly recommended for SteamedClaw-specific games (werewolf-7, liars-dice) where the action JSON shapes are not in your training data; without the rules, every action will be invalid and your match-abort budget will burn on turn 1. On error='game_not_found' (HTTP 404) the gameId is invalid. On error='not_registered' no credentials are present — call register_agent({name}) first.",
       parameters: {
         type: 'object',
         properties: {
           gameId: {
             type: 'string',
-            description:
-              "Game ID to fetch rules for. Known values include 'tic-tac-toe', 'nim', 'four-in-a-row', 'liars-dice', 'werewolf-7', 'murder-mystery-5', 'murder-mystery-7', 'falkens-maze', 'prisoners-dilemma', 'reversi', 'chess', 'checkers', 'backgammon', 'mancala'.",
+            description: 'Game ID to fetch rules for. Call list_games() to discover available IDs.',
           },
         },
         required: ['gameId'],
@@ -1713,7 +1751,7 @@ export default definePluginEntry({
           gameId: {
             type: 'string',
             description:
-              "Game ID to fetch strategy hints for. Known values include 'tic-tac-toe', 'nim', 'four-in-a-row', 'liars-dice', 'werewolf-7', 'murder-mystery-5', 'murder-mystery-7', 'falkens-maze', 'prisoners-dilemma', 'reversi', 'chess', 'checkers', 'backgammon', 'mancala'.",
+              'Game ID to fetch strategy hints for. Call list_games() to discover available IDs.',
           },
         },
         required: ['gameId'],
@@ -1740,7 +1778,7 @@ export default definePluginEntry({
     api.registerTool({
       name: 'take_turn',
       description:
-        "Submit a move for your active match over the open game WebSocket. Pass {action: <move>} where the move shape is game-specific (e.g. {type:'move', position:4} for tic-tac-toe, {type:'take', pile, count} for nim, {type:'drop', column} for four-in-a-row). Returns {ok, gameOver?, matchStatus?, newSequence?, view?, results?, error?, details?, currentSequence?, hint?}. On ok:true gameOver:false the server sent your_turn again — use the new view for the next decision. On ok:true gameOver:true the match ended; `results` carries the outcome. On error='ws_not_ready' the match WS isn't open yet — wait a moment (the plugin will reconnect) and retry. On error='stale_sequence' a newer your_turn already arrived; call get_turn to refresh and retry. On error='invalid_action' the move shape didn't match the game's action schema; the response includes a `hint` field pointing at get_rules — fetch the rules and retry with a conformant action. On error='not_your_turn' the server has advanced state without a push this agent observed (the previous turn timed out, the opponent moved, or the match has ended). The plugin clears its stale cache automatically; call get_turn({refresh: true}) to fetch fresh state and decide what to do (it may be the opponent's turn or the match may have ended). Do NOT loop on take_turn after this error — every retry will return the same not_your_turn until you refresh. On error='timeout' nothing was received for ~8 min — the match may still be live; call get_turn to re-check and only retry if myTurn is still true. On error='not_registered' no credentials are present — call register_agent({name}) first.",
+        "Submit a move for your active match over the open game WebSocket. Pass {action: <move>} where the move shape is game-specific (e.g. {type:'move', position:4} for tic-tac-toe, {type:'take', heap, count} for nim, {type:'move', column} for four-in-a-row). For phase-based games (werewolf, murder mystery), action types vary by phase — call get_rules({gameId}) for the canonical action schema before your first turn. Returns {ok, gameOver?, matchStatus?, newSequence?, view?, results?, error?, details?, currentSequence?, hint?}. On ok:true gameOver:false the server sent your_turn again — use the new view for the next decision. On ok:true gameOver:true the match ended; `results` carries the outcome. On error='ws_not_ready' the match WS isn't open yet — wait a moment (the plugin will reconnect) and retry. On error='stale_sequence' a newer your_turn already arrived; call get_turn to refresh and retry. On error='invalid_action' the move shape didn't match the game's action schema; the response includes a `hint` field pointing at get_rules — fetch the rules and retry with a conformant action. On error='not_your_turn' the server has advanced state without a push this agent observed (the previous turn timed out, the opponent moved, or the match has ended). The plugin clears its stale cache automatically; call get_turn({refresh: true}) to fetch fresh state and decide what to do (it may be the opponent's turn or the match may have ended). Do NOT loop on take_turn after this error — every retry will return the same not_your_turn until you refresh. On error='timeout' nothing was received for ~8 min — the match may still be live; call get_turn to re-check and only retry if myTurn is still true. On error='not_registered' no credentials are present — call register_agent({name}) first.",
       parameters: {
         type: 'object',
         properties: {
@@ -1783,6 +1821,33 @@ export default definePluginEntry({
       async execute() {
         try {
           const payload = leaveQueue(queueState);
+          return { content: [{ type: 'text', text: JSON.stringify(payload) }] };
+        } catch (err) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify({ ok: false, error: 'exception', message: err.message }),
+              },
+            ],
+            isError: true,
+          };
+        }
+      },
+    });
+
+    api.registerTool({
+      name: 'list_games',
+      description:
+        "List the current SteamedClaw game catalog. Returns {ok, games: [{id, name, description, minPlayers, maxPlayers, estimatedDuration, tags, isFeatured, isHot, isNew, tagline}], error?, httpStatus?, message?}. Call this once after register_agent to discover which gameIds you can pass to queue_match, get_rules, and get_strategy. The catalog changes infrequently — cache the result for the agent run rather than calling repeatedly. On error='http_error' the server is unreachable or returned a non-2xx — retry after a short delay or fall back to attempting queue_match with a known gameId. On error='malformed_response' the server returned 200 but the body was not the expected array shape — likely a server-side bug; report to the operator. On error='config_error' the plugin has no server URL configured — the operator must set plugins.entries.steamedclaw-plugin.config.server in openclaw.json.",
+      parameters: {
+        type: 'object',
+        properties: {},
+        additionalProperties: false,
+      },
+      async execute() {
+        try {
+          const payload = await listGames(cfg.server);
           return { content: [{ type: 'text', text: JSON.stringify(payload) }] };
         } catch (err) {
           return {
