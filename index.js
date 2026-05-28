@@ -70,7 +70,7 @@ const QUEUE_POLL_MS = 30000;
 
 // Distinctive UA so server-side analysis can classify plugin-origin
 // traffic. Bumped alongside package.json.
-const PLUGIN_USER_AGENT = 'steamedclaw-plugin/0.9.17';
+const PLUGIN_USER_AGENT = 'steamedclaw-plugin/0.9.18';
 
 // Match lanes. PLUGIN_LANES mirrors LANES from @botoff/shared
 // (packages/shared/src/schemas/api.ts); the plugin ships standalone and
@@ -221,6 +221,93 @@ function writeClaimIfAbsent(claimUrl, verificationCode) {
       announced: true,
     }),
   );
+}
+
+// Read the current Status field from claim.md without parsing the rest.
+// Returns null when claim.md is missing, an empty trimmed string when
+// the Status line is absent or empty, or the trimmed value otherwise.
+function readClaimStatus() {
+  if (!fs.existsSync(CLAIM)) return null;
+  const text = fs.readFileSync(CLAIM, 'utf8');
+  const match = text.match(/^Status:\s*(.*)$/m);
+  if (!match) return '';
+  return match[1].trim();
+}
+
+// Targeted Status-only rewrite. Reads claim.md, replaces only the
+// `Status: ...` line, and writes the result back — every other field
+// (Claim URL, Verification code, Registered, Announced) is preserved.
+// Required so the write-once invariant on claim.md is not defeated by
+// the boot-time reconciliation path.
+function rewriteClaimStatus(newStatus) {
+  if (!fs.existsSync(CLAIM)) return false;
+  const text = fs.readFileSync(CLAIM, 'utf8');
+  const next = text.replace(/^Status:\s*.*$/m, `Status: ${newStatus}`);
+  if (next === text) return false;
+  fs.writeFileSync(CLAIM, next);
+  return true;
+}
+
+// Boot-time reconciliation (#389). Once per plugin boot, when claim.md
+// shows `Status: unclaimed`, fire one GET /api/agents/:id and — if the
+// server reports an owner block — rewrite the Status line to `claimed`.
+// Operator-facing only: the LLM does not read claim.md and the plugin's
+// runtime logic does not gate on Status, so any failure here is logged
+// and swallowed. Idempotent across restart because the rewrite flips
+// the guard (`Status: claimed` short-circuits next boot).
+async function reconcileClaimStatus(api) {
+  let status;
+  try {
+    status = readClaimStatus();
+  } catch (err) {
+    api.logger.warn?.(
+      `[steamedclaw-claim] reconcile: read claim.md failed: ${err.message} — skipping`,
+    );
+    return;
+  }
+  if (status === null) return;
+  if (status !== 'unclaimed') return;
+
+  const creds = readCredentials();
+  if (!creds) {
+    api.logger.warn?.(
+      '[steamedclaw-claim] reconcile: claim.md says unclaimed but credentials.md missing — skipping',
+    );
+    return;
+  }
+
+  const url = `${creds.server}/api/agents/${encodeURIComponent(creds.agentId)}`;
+  let res;
+  try {
+    res = await httpRequest('GET', url, null, undefined);
+  } catch (err) {
+    api.logger.warn?.(`[steamedclaw-claim] reconcile: network error: ${err.message} — skipping`);
+    return;
+  }
+  if (res.status < 200 || res.status >= 300) {
+    api.logger.warn?.(
+      `[steamedclaw-claim] reconcile: HTTP ${res.status} from /api/agents/:id — skipping`,
+    );
+    return;
+  }
+
+  const owner =
+    res.data && typeof res.data === 'object' && !Array.isArray(res.data) ? res.data.owner : null;
+  const displayName =
+    owner && typeof owner === 'object' && typeof owner.displayName === 'string'
+      ? owner.displayName
+      : '';
+  if (!displayName) return;
+
+  try {
+    if (rewriteClaimStatus('claimed')) {
+      api.logger.info?.(
+        `[steamedclaw-claim] claim.md reconciled to Status: claimed (owner: ${displayName})`,
+      );
+    }
+  } catch (err) {
+    api.logger.warn?.(`[steamedclaw-claim] reconcile: rewrite failed: ${err.message} — skipping`);
+  }
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1872,5 +1959,12 @@ export default definePluginEntry({
         `[steamedclaw-match] services NOT registered (mode=${api.registrationMode}); tools still available`,
       );
     }
+
+    // Boot-time claim.md reconciliation (#389). Fire-and-forget — the
+    // promise is intentionally not awaited so register() returns
+    // synchronously; reconcileClaimStatus swallows every error path
+    // internally. No-op when claim.md is absent or already
+    // `Status: claimed` (idempotent across restarts).
+    void reconcileClaimStatus(api);
   },
 });
