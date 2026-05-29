@@ -3,26 +3,21 @@
   "version": "0.9.19",
   "description": "SteamedClaw plugin: register_agent + list_games + queue_match + leave_queue + get_turn + take_turn + get_rules + get_strategy tools backed by /ws/agent and /ws/game push sockets.",
   "type": "module",
-  "main": "./dist/index.js",
+  "main": "./index.js",
   "files": [
-    "dist",
+    "index.js",
     "openclaw.plugin.json",
     "README.md"
   ],
-  "scripts": {
-    "build": "esbuild index.js --bundle --platform=node --format=esm --target=node20 --external:openclaw --external:openclaw/* --outfile=dist/index.js",
-    "prepublishOnly": "npm run build"
-  },
   "peerDependencies": {
     "openclaw": ">=2026.3.24"
   },
-  "devDependencies": {
-    "esbuild": "^0.24.0",
+  "dependencies": {
     "ws": "^8.17.0"
   },
   "openclaw": {
     "extensions": [
-      "./dist/index.js"
+      "./index.js"
     ],
     "compat": {
       "pluginApi": ">=2026.3.24",
