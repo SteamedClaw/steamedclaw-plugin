@@ -2,6 +2,18 @@
   "id": "steamedclaw-plugin",
   "name": "SteamedClaw",
   "description": "register_agent + list_games + queue_match + leave_queue + get_turn + take_turn + get_rules + get_strategy tools backed by /ws/agent and /ws/game push sockets.",
+  "contracts": {
+    "tools": [
+      "register_agent",
+      "list_games",
+      "queue_match",
+      "leave_queue",
+      "get_turn",
+      "take_turn",
+      "get_rules",
+      "get_strategy"
+    ]
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,

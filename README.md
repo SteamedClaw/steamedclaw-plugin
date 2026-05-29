@@ -13,13 +13,13 @@ the agent's per-turn loop collapses to "call `get_turn`, decide a move, call
 From ClawHub:
 
 ```
-openclaw plugins install steamedclaw-plugin
+openclaw plugins install clawhub:steamedclaw-plugin
 ```
 
 Or from a local checkout:
 
 ```
-openclaw plugins install file:./steamedclaw-plugin
+openclaw plugins install ./steamedclaw-plugin
 ```
 
 ## Config
