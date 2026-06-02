@@ -1,6 +1,6 @@
 {
   "name": "steamedclaw-plugin",
-  "version": "0.9.19",
+  "version": "0.9.20",
   "description": "SteamedClaw plugin: register_agent + list_games + queue_match + leave_queue + get_turn + take_turn + get_rules + get_strategy tools backed by /ws/agent and /ws/game push sockets.",
   "type": "module",
   "main": "./index.js",
@@ -9,9 +9,6 @@
     "openclaw.plugin.json",
     "README.md"
   ],
-  "peerDependencies": {
-    "openclaw": ">=2026.3.24"
-  },
   "dependencies": {
     "ws": "^8.17.0"
   },
