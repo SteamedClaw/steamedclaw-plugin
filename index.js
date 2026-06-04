@@ -70,7 +70,21 @@ const QUEUE_POLL_MS = 30000;
 
 // Distinctive UA so server-side analysis can classify plugin-origin
 // traffic. Bumped alongside package.json.
-const PLUGIN_USER_AGENT = 'steamedclaw-plugin/0.9.20';
+const PLUGIN_USER_AGENT = 'steamedclaw-plugin/0.9.21';
+
+// Instance-identity instrumentation (#457). Each module evaluation gets a
+// distinct PLUGIN_INSTANCE_ID and each makeMatchWsService() construction a
+// distinct matchSvcId. Logging both at service start, socket open, and on
+// every tool invocation lets us prove (on the next ws_not_ready repro)
+// whether the take_turn tool ran in a DIFFERENT instance than the one
+// holding the live /ws/game socket — the service/tool instance split
+// hypothesised for the OpenClaw/Codex multi-mode loader.
+let __scInstanceCounter = 0;
+function genInstanceId() {
+  __scInstanceCounter += 1;
+  return `${__scInstanceCounter}-${Math.random().toString(36).slice(2, 8)}`;
+}
+const PLUGIN_INSTANCE_ID = genInstanceId();
 
 // Match lanes. PLUGIN_LANES mirrors LANES from @botoff/shared
 // (packages/shared/src/schemas/api.ts); the plugin ships standalone and
@@ -692,16 +706,204 @@ async function getTurn(matchSvc, opts = {}) {
   };
 }
 
+// Build the get_rules recovery hint surfaced on invalid_action (#397).
+// Shared by the WS error handler and the HTTP fallback so both paths give
+// the LLM the same nudge toward the action schema.
+function invalidActionHint() {
+  const game = readCurrentMatch()?.game;
+  return game
+    ? `Action shape rejected. Check the ${game} rules for the valid action schema (call get_rules({gameId: "${game}"}) if you don't already have them).`
+    : `Action shape rejected. Call get_rules({gameId}) for the current game's action schema.`;
+}
+
+// HTTP self-heal fallback for take_turn (#457). The primary path submits
+// over the open /ws/game socket; this runs only when that socket is not
+// reachable from THIS plugin instance — the tool invocation ran in a
+// different module instance than the one holding the live socket, or the
+// in-memory ws handle was lost. The server's POST /api/matches/:id/action
+// resolves the same game-loop pending action a WS frame would and needs no
+// socket, so the move lands without opening a second /ws/game connection
+// (which the server's most-recent-wins socket map would let clobber the
+// service's live push socket).
+//
+// This intentionally revisits the "no HTTP fallback by design" note (#386).
+// That decision assumed a persistently-down match WS, where submitting one
+// move is futile because no future your_turn push would wake the agent.
+// #457 is a different failure mode: the service-side WS is UP (it received
+// your_turn and woke the agent) and only the tool-side submit path was
+// blind to it — so with the wake loop intact, an HTTP submit completes the
+// turn. In the genuine WS-down case it is at worst neutral (the move lands;
+// the next wake still depends on the WS exactly as before).
+async function submitActionViaHttp(creds, matchSvc, match, action) {
+  const matchId = match.matchId;
+
+  // 1. Resolve the sequence. Prefer the cache primed by a prior your_turn
+  //    push or get_turn refresh; otherwise ask the server (authoritative).
+  let sequence = matchSvc ? matchSvc.getCachedTurn(matchId)?.sequence : undefined;
+  if (typeof sequence !== 'number') {
+    let stateRes;
+    try {
+      stateRes = await httpRequest(
+        'GET',
+        `${creds.server}/api/matches/${matchId}/state?wait=false`,
+        creds.apiKey,
+        null,
+      );
+    } catch (err) {
+      return {
+        ok: false,
+        error: 'ws_not_ready',
+        message: `Match WS not open and the HTTP state fetch failed: ${err.message}`,
+      };
+    }
+    if (
+      stateRes.status === 404 &&
+      typeof stateRes.data?.error === 'string' &&
+      stateRes.data.error === 'match_not_found'
+    ) {
+      if (matchSvc) matchSvc.invalidateCachedTurn(matchId);
+      clearCurrentMatch();
+      return {
+        ok: false,
+        error: 'no_active_match',
+        message: 'Match has ended on the server. Call queue_match to start a new game.',
+      };
+    }
+    if (stateRes.status !== 200) {
+      return {
+        ok: false,
+        error: 'ws_not_ready',
+        message: `Match WS not open and the HTTP state fetch returned ${stateRes.status}.`,
+      };
+    }
+    const sb = stateRes.data ?? {};
+    if (typeof sb.status === 'string' && TERMINAL_MATCH_STATUSES.has(sb.status)) {
+      if (matchSvc) matchSvc.invalidateCachedTurn(matchId);
+      clearCurrentMatch();
+      return {
+        ok: false,
+        error: 'game_already_over',
+        message: 'Match has ended on the server. Call queue_match to start a new game.',
+      };
+    }
+    if (sb.status !== 'your_turn' || typeof sb.sequence !== 'number') {
+      // Server says it is not this agent's turn — don't submit blind.
+      return {
+        ok: false,
+        error: 'not_your_turn',
+        details:
+          'Server state shows it is not your turn. Call get_turn({refresh: true}) to re-read fresh state before acting.',
+        currentSequence: typeof sb.sequence === 'number' ? sb.sequence : undefined,
+      };
+    }
+    sequence = sb.sequence;
+    if (matchSvc) matchSvc.primeCachedTurn(matchId, sequence, sb.view);
+  }
+
+  // 2. Submit the action over HTTP.
+  let res;
+  try {
+    res = await httpRequest('POST', `${creds.server}/api/matches/${matchId}/action`, creds.apiKey, {
+      sequence,
+      action,
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      error: 'ws_not_ready',
+      message: `Match WS not open and the HTTP action submit failed: ${err.message}`,
+    };
+  }
+
+  // 3. Map the response into take_turn's normal ack shape.
+  if (res.status === 200 && res.data?.success === true && res.data.state) {
+    const st = res.data.state;
+    if (typeof st.status === 'string' && TERMINAL_MATCH_STATUSES.has(st.status)) {
+      // A submitted action only ends a game by completion, never by the
+      // inactivity/disconnect path that produces 'aborted'.
+      clearCurrentMatch();
+      if (matchSvc) matchSvc.invalidateCachedTurn(matchId);
+      return {
+        ok: true,
+        gameOver: true,
+        matchStatus: 'completed',
+        results: st.results,
+        replayUrl: st.replayUrl,
+      };
+    }
+    if (matchSvc) {
+      if (st.status === 'your_turn' && typeof st.sequence === 'number') {
+        matchSvc.primeCachedTurn(matchId, st.sequence, st.view);
+      } else {
+        // No longer our turn — drop the stale cached your_turn so a
+        // follow-up get_turn hot path doesn't replay it.
+        matchSvc.invalidateCachedTurn(matchId);
+      }
+    }
+    return {
+      ok: true,
+      gameOver: false,
+      matchStatus: typeof st.status === 'string' ? st.status : 'waiting',
+      newSequence: st.sequence,
+      view: st.view,
+    };
+  }
+
+  const errBody = res.data ?? {};
+  const errorCode = typeof errBody.error === 'string' ? errBody.error : 'http_error';
+
+  if (res.status === 409 || errorCode === 'stale_sequence') {
+    if (matchSvc) matchSvc.invalidateCachedTurn(matchId);
+    return { ok: false, error: 'stale_sequence', currentSequence: errBody.currentSequence };
+  }
+  if (errorCode === 'not_your_turn') {
+    if (matchSvc) matchSvc.invalidateCachedTurn(matchId);
+    return {
+      ok: false,
+      error: 'not_your_turn',
+      details:
+        typeof errBody.details === 'string'
+          ? errBody.details
+          : 'Server advanced state without a push this agent observed. Call get_turn({refresh: true}) to fetch fresh state before retrying.',
+      currentSequence: errBody.currentSequence,
+    };
+  }
+  if (errorCode === 'invalid_action') {
+    return {
+      ok: false,
+      error: 'invalid_action',
+      details: errBody.details,
+      hint: invalidActionHint(),
+    };
+  }
+  if (errorCode === 'game_already_over') {
+    clearCurrentMatch();
+    if (matchSvc) matchSvc.invalidateCachedTurn(matchId);
+    return {
+      ok: false,
+      error: 'game_already_over',
+      message: 'Match has ended on the server. Call queue_match to start a new game.',
+    };
+  }
+  return { ok: false, error: errorCode, details: errBody.details, httpStatus: res.status };
+}
+
 async function takeTurn(matchSvc, action) {
   const creds = readCredentials();
   if (!creds) return { ok: false, error: 'not_registered', message: NOT_REGISTERED_MESSAGE };
   const match = readCurrentMatch();
   if (!match) return { ok: false, error: 'no_active_match' };
-  if (!matchSvc) return { ok: false, error: 'ws_not_ready' };
-  if (!matchSvc.isSocketOpenFor(match.matchId)) {
-    return { ok: false, error: 'ws_not_ready' };
+  const socketOpen = !!matchSvc && matchSvc.isSocketOpenFor(match.matchId);
+  // Instrumentation (#457): record which plugin/match-service instance
+  // handled this tool call and whether it sees the live socket.
+  if (matchSvc?.logToolInvocation) {
+    matchSvc.logToolInvocation('take_turn', match.matchId, socketOpen);
   }
-  return matchSvc.submitAction(match.matchId, action, TAKE_TURN_TIMEOUT_MS);
+  if (socketOpen) {
+    return matchSvc.submitAction(match.matchId, action, TAKE_TURN_TIMEOUT_MS);
+  }
+  // WS not reachable from this instance — self-heal over HTTP (#457).
+  return submitActionViaHttp(creds, matchSvc, match, action);
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -821,6 +1023,8 @@ function httpToWsUrl(serverUrl, matchId) {
 
 function makeMatchWsService(api) {
   const logger = api.logger;
+  // Per-construction id for instance-split diagnosis (#457).
+  const matchSvcId = genInstanceId();
 
   let stopped = false;
   let poller;
@@ -881,7 +1085,9 @@ function makeMatchWsService(api) {
 
     socket.on('open', () => {
       reconnectAttempts = 0;
-      logger.info?.(`[steamedclaw-match] connected match ${matchId}`);
+      logger.info?.(
+        `[steamedclaw-match] connected match ${matchId} plugin=${PLUGIN_INSTANCE_ID} matchSvc=${matchSvcId}`,
+      );
     });
 
     socket.on('message', (raw) => {
@@ -981,10 +1187,7 @@ function makeMatchWsService(api) {
         };
         // Hint LLMs at get_rules so minimal SOULs have a recovery path (#397).
         if (errorCode === 'invalid_action') {
-          const game = readCurrentMatch()?.game;
-          errorResult.hint = game
-            ? `Action shape rejected. Check the ${game} rules for the valid action schema (call get_rules({gameId: "${game}"}) if you don't already have them).`
-            : `Action shape rejected. Call get_rules({gameId}) for the current game's action schema.`;
+          errorResult.hint = invalidActionHint();
         }
         resolvePendingTakeTurn(errorResult);
         return;
@@ -1128,7 +1331,9 @@ function makeMatchWsService(api) {
   return {
     id: 'steamedclaw-match-service',
     async start() {
-      logger.info?.(`[steamedclaw-match] service starting (mode=${api.registrationMode})`);
+      logger.info?.(
+        `[steamedclaw-match] service starting (mode=${api.registrationMode}) plugin=${PLUGIN_INSTANCE_ID} matchSvc=${matchSvcId}`,
+      );
       const creds = readCredentials();
       if (!creds) {
         logger.info?.('[steamedclaw-match] no credentials yet; waiting for register_agent');
@@ -1166,6 +1371,15 @@ function makeMatchWsService(api) {
     submitAction,
     isSocketOpenFor,
     onMatchFoundExternal,
+    instanceId: matchSvcId,
+    // #457 instrumentation — log which instance handled a tool call and
+    // whether it can see the live socket. Differing ids here vs at
+    // socket-open on a ws_not_ready repro confirm the service/tool split.
+    logToolInvocation(tool, matchId, socketOpen) {
+      logger.info?.(
+        `[steamedclaw-match] ${tool} plugin=${PLUGIN_INSTANCE_ID} matchSvc=${matchSvcId} reqMatch=${matchId} curMatch=${currentMatchId} ready=${ws ? ws.readyState : 'none'} open=${socketOpen}`,
+      );
+    },
   };
 }
 
@@ -1865,7 +2079,7 @@ export default definePluginEntry({
     api.registerTool({
       name: 'take_turn',
       description:
-        "Submit a move for your active match over the open game WebSocket. Pass {action: <move>} where the move shape is game-specific (e.g. {type:'move', position:4} for tic-tac-toe, {type:'take', heap, count} for nim, {type:'move', column} for four-in-a-row). For phase-based games (werewolf, murder mystery), action types vary by phase — call get_rules({gameId}) for the canonical action schema before your first turn. Returns {ok, gameOver?, matchStatus?, newSequence?, view?, results?, error?, details?, currentSequence?, hint?}. On ok:true gameOver:false the server sent your_turn again — use the new view for the next decision. On ok:true gameOver:true the match ended; `results` carries the outcome. On error='ws_not_ready' the match WS isn't open yet — wait a moment (the plugin will reconnect) and retry. On error='stale_sequence' a newer your_turn already arrived; call get_turn to refresh and retry. On error='invalid_action' the move shape didn't match the game's action schema; the response includes a `hint` field pointing at get_rules — fetch the rules and retry with a conformant action. On error='not_your_turn' the server has advanced state without a push this agent observed (the previous turn timed out, the opponent moved, or the match has ended). The plugin clears its stale cache automatically; call get_turn({refresh: true}) to fetch fresh state and decide what to do (it may be the opponent's turn or the match may have ended). Do NOT loop on take_turn after this error — every retry will return the same not_your_turn until you refresh. On error='timeout' nothing was received for ~8 min — the match may still be live; call get_turn to re-check and only retry if myTurn is still true. On error='not_registered' no credentials are present — call register_agent({name}) first.",
+        "Submit a move for your active match. The plugin sends it over the open game WebSocket, and if that socket isn't reachable it automatically falls back to an HTTP submit — you call take_turn the same way regardless. Pass {action: <move>} where the move shape is game-specific (e.g. {type:'move', position:4} for tic-tac-toe, {type:'take', heap, count} for nim, {type:'move', column} for four-in-a-row). For phase-based games (werewolf, murder mystery), action types vary by phase — call get_rules({gameId}) for the canonical action schema before your first turn. Returns {ok, gameOver?, matchStatus?, newSequence?, view?, results?, error?, details?, currentSequence?, hint?, message?}. On ok:true gameOver:false the server accepted the move — use the new view for the next decision. On ok:true gameOver:true the match ended; `results` carries the outcome. On error='ws_not_ready' neither the WebSocket nor the HTTP fallback could submit (the `message` field gives the concrete reason); this is usually transient — wait a moment and retry, or call get_turn to re-check state. On error='stale_sequence' a newer your_turn already arrived; call get_turn to refresh and retry. On error='invalid_action' the move shape didn't match the game's action schema; the response includes a `hint` field pointing at get_rules — fetch the rules and retry with a conformant action. On error='not_your_turn' the server has advanced state without a push this agent observed (the previous turn timed out, the opponent moved, or the match has ended). The plugin clears its stale cache automatically; call get_turn({refresh: true}) to fetch fresh state and decide what to do (it may be the opponent's turn or the match may have ended). Do NOT loop on take_turn after this error — every retry will return the same not_your_turn until you refresh. On error='timeout' nothing was received for ~8 min — the match may still be live; call get_turn to re-check and only retry if myTurn is still true. On error='not_registered' no credentials are present — call register_agent({name}) first.",
       parameters: {
         type: 'object',
         properties: {
