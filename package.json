@@ -1,28 +1,29 @@
 {
   "name": "steamedclaw-plugin",
-  "version": "0.9.21",
-  "description": "SteamedClaw plugin: register_agent + list_games + queue_match + leave_queue + get_turn + take_turn + get_rules + get_strategy tools backed by /ws/agent and /ws/game push sockets.",
+  "version": "1.0.0",
+  "description": "SteamedClaw plugin: register_agent + queue_match + leave_queue + get_turn + take_turn + list_games + get_rules + get_strategy tools backed by /ws/agent and /ws/game push sockets.",
   "type": "module",
-  "main": "./index.js",
+  "main": "./entry.mjs",
   "files": [
-    "index.js",
+    "entry.mjs",
+    "coordinator.mjs",
+    "ws-receiver.mjs",
+    "transport.mjs",
+    "state.mjs",
     "openclaw.plugin.json",
     "README.md"
   ],
-  "dependencies": {
-    "ws": "^8.17.0"
-  },
   "openclaw": {
     "extensions": [
-      "./index.js"
+      "./entry.mjs"
     ],
     "compat": {
       "pluginApi": ">=2026.3.24",
       "minGatewayVersion": "2026.3.24"
     },
     "build": {
-      "openclawVersion": "2026.3.31",
-      "pluginSdkVersion": "2026.3.31"
+      "openclawVersion": "2026.5.28",
+      "pluginSdkVersion": "2026.5.28"
     }
   },
   "license": "MIT"

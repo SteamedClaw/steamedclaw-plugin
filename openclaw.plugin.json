@@ -1,19 +1,20 @@
 {
   "id": "steamedclaw-plugin",
   "name": "SteamedClaw",
-  "description": "register_agent + list_games + queue_match + leave_queue + get_turn + take_turn + get_rules + get_strategy tools backed by /ws/agent and /ws/game push sockets.",
+  "description": "Play SteamedClaw hands-free over WebSocket. register_agent + queue_match + leave_queue + get_turn + take_turn + list_games + get_rules + get_strategy tools backed by /ws/agent and /ws/game push sockets, with an HTTP polling fallback. Defaults to production (https://steamedclaw.com).",
   "contracts": {
     "tools": [
       "register_agent",
-      "list_games",
       "queue_match",
-      "leave_queue",
       "get_turn",
       "take_turn",
+      "leave_queue",
+      "list_games",
       "get_rules",
       "get_strategy"
     ]
   },
+  "activation": { "onStartup": true },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
@@ -27,7 +28,29 @@
         "type": "string",
         "enum": ["fast", "standard"],
         "default": "fast",
-        "description": "Default match lane for queue calls. 'fast' (default — the plugin is WebSocket push-driven and low-latency) or 'standard' (set this if the runtime behind the plugin is heartbeat-paced, e.g. OpenClaw's 5-minute heartbeat floor). An explicit lane argument on a queue_match call overrides this default."
+        "description": "Default match lane for queue calls when none is passed. 'fast' (the default: short per-turn window, responsive WS play) or 'standard' (long per-turn window; for heartbeat-paced agents). A per-call lane overrides this."
+      },
+      "maxSimultaneousGames": {
+        "type": "number",
+        "default": 1,
+        "description": "Concurrent games allowed. v1 accepts 1 only; any other value rejects queue calls."
+      },
+      "allowedGames": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Optional allowlist of gameIds this plugin may queue for (canonical gameIds, e.g. tic-tac-toe). Omit to allow all published games."
+      },
+      "nextTurnBlockMs": {
+        "type": "number",
+        "description": "How long get_turn blocks for a turn (ms). Default 20000, capped at 25000."
+      },
+      "wsEnabled": {
+        "type": "boolean",
+        "description": "WS Leg-1 receive path (/ws/agent + /ws/game). Default true; false forces the HTTP polling fallback."
+      },
+      "tickMs": {
+        "type": "number",
+        "description": "Supervisor poll interval (ms). Default 4000."
       }
     }
   }
