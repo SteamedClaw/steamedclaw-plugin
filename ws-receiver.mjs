@@ -190,8 +190,13 @@ export function openGame(matchId) {
       case 'error':
         log('warn', `[ws] /ws/game/${matchId} server error: ${frame.error ?? 'unknown'}`);
         break;
+      case 'message':
+        //  In-game chat (discussion games) — buffered by the coordinator and
+        //  surfaced on get_turn results (#538). Frame: {type, from, text, to}.
+        RECEIVER.callbacks?.onMessage?.(frame);
+        break;
       default:
-        break; //  'message' (in-game chat) — not used by the plugin
+        break;
     }
   });
   sock.addEventListener('error', (ev) => {
@@ -258,10 +263,11 @@ export function startReceiver({
   onMatchFound,
   onYourTurn,
   onGameOver,
+  onMessage,
 }) {
   RECEIVER.generation += 1;
   RECEIVER.cfg = { server, apiKey, makeWebSocket, logger };
-  RECEIVER.callbacks = { onMatchFound, onYourTurn, onGameOver };
+  RECEIVER.callbacks = { onMatchFound, onYourTurn, onGameOver, onMessage };
   RECEIVER.stopped = false;
   //  Adopt a live socket from the previous generation instead of replacing it.
   if (RECEIVER.agent?.sock) {

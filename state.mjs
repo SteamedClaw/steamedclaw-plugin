@@ -29,12 +29,22 @@ export function readCredentials() {
   return { server, agentId, apiKey, name };
 }
 
+// H2 (087 security review): credentials.md holds the API key and claim.md holds
+// the claim URL + verification code — both must be owner-only so a co-tenant on a
+// shared host can't read the key or hijack the claim. Create the dir 0700 and the
+// files 0600 (the standard plaintext-token convention; mirrors OpenClaw's own
+// credential-file discipline). Both writers are create-only paths (register
+// short-circuits on existing creds; claim is write-once), so the create-time
+// `mode` reliably applies to every FRESH registration. `mode` is honored only at
+// creation, so hardenStatePermissions() below backfills installs that registered
+// under a pre-1.0.1 version (0.9.x or 1.0.0). `mode` is a no-op on Windows — harmless.
 export function writeCredentials(server, agentId, apiKey, name) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
   const nameLine = name ? `Name: ${name}\n` : '';
   fs.writeFileSync(
     CREDENTIALS,
     `Server: ${server}\nAgent ID: ${agentId}\nAPI Key: ${apiKey}\n${nameLine}`,
+    { mode: 0o600 },
   );
 }
 
@@ -45,12 +55,35 @@ export function writeCredentials(server, agentId, apiKey, name) {
 // claim.md survived) must not clobber the original claim URL.
 export function writeClaimIfAbsent(claimUrl, verificationCode) {
   if (fs.existsSync(CLAIM)) return;
-  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
   fs.writeFileSync(
     CLAIM,
     `Claim URL: ${claimUrl}\n` +
       `Verification code: ${verificationCode || ''}\n` +
       `Registered: ${new Date().toISOString()}\n` +
       `Status: unclaimed\n`,
+    { mode: 0o600 },
   );
 }
+
+// H2 backfill: create-time `mode` (above) does not retroactively fix a dir/file
+// that already exists, so an install that registered under 0.9.x or 1.0.0 keeps
+// its loose perms. Chmod owner-only at module load, best-effort. The skill's 088
+// fix (`hardenStatePermissions` in steamedclaw-helper.js) does the same for this
+// SHARED data dir, so hardening is deterministic regardless of which writer —
+// skill or plugin — touches the dir first. chmod is a no-op on Windows.
+function hardenStatePermissions() {
+  try {
+    fs.chmodSync(DATA_DIR, 0o700);
+  } catch {
+    /* best-effort: dir may not exist yet */
+  }
+  for (const file of [CREDENTIALS, CLAIM]) {
+    try {
+      if (fs.existsSync(file)) fs.chmodSync(file, 0o600);
+    } catch {
+      /* best-effort */
+    }
+  }
+}
+hardenStatePermissions();

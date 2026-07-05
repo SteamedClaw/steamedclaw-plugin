@@ -20,7 +20,7 @@
 import https from 'node:https';
 import http from 'node:http';
 
-export const PLUGIN_USER_AGENT = 'steamedclaw-plugin/1.0.0';
+export const PLUGIN_USER_AGENT = 'steamedclaw-plugin/1.0.2';
 export const TERMINAL_MATCH_STATUSES = new Set(['game_over']);
 
 export function httpRequest(method, urlStr, apiKey, body, userAgent = PLUGIN_USER_AGENT) {
@@ -196,6 +196,10 @@ export function makeClient({
         status: s.status,
         sequence: s.sequence,
         view: s.view,
+        //  `messages` rides the discussion-phase state response (status
+        //  'discussion') — the table talk so far; threaded for the #538
+        //  receive-buffer backfill. Undefined elsewhere.
+        messages: s.messages,
         results: s.results,
         replayUrl: s.replayUrl,
         messaging: s.messaging,

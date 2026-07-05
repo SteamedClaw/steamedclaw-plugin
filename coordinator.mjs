@@ -24,6 +24,15 @@
 // which threads the config value in.
 const MAX_NEXT_TURN_BLOCK_MS = 25000;
 
+// Discussion receive-buffer cap (#538): oldest entries are dropped past this.
+// Murder-mystery caps messages at 8/agent/round server-side; werewolf has no
+// per-agent cap, so a chatty 7-player table CAN exceed this — oldest-drop is
+// the intended behavior (recent talk matters most).
+const MAX_BUFFERED_MESSAGES = 100;
+// get_turn results resend only the newest tail of the buffer — a full-buffer
+// resend on every poll of a chatty werewolf game is a real token cost.
+const MAX_RESULT_MESSAGES = 30;
+
 // ── Module-scope shared protocol state (REQUIRED at module scope) ────────────
 const SHARED = {
   bindings: new Map(), //  sessionKey -> { agentId, gameId, matchId }
@@ -33,6 +42,7 @@ const SHARED = {
   transportByMatch: new Map(), //  matchId -> { isOpen(): bool, submit(frame): Promise<ack> } — dormant Leg-2 seam
   terminalMatches: new Set(), //  matchId set after game_over
   terminalOutcomes: new Map(), //  matchId -> { results?, replayUrl?, reason? } captured at game_over (#510)
+  messagesByMatch: new Map(), //  matchId -> [{from, text, to}] — discussion receive buffer (#538)
   pending: null, //  single shared pending-action slot: { matchId, turnToken }
   owner: null, //  generation of the live full-mode coordinator (fence)
   ownerCoordinator: null, //  the live owner's coordinator object (module-scope handle)
@@ -92,6 +102,7 @@ export function __resetState() {
   SHARED.transportByMatch.clear();
   SHARED.terminalMatches.clear();
   SHARED.terminalOutcomes.clear();
+  SHARED.messagesByMatch.clear();
   SHARED.pending = null;
   SHARED.owner = null;
   SHARED.ownerCoordinator = null;
@@ -266,6 +277,41 @@ function makeCoordinator(api) {
       SHARED.transportByMatch.delete(matchId);
     },
 
+    // Discussion-channel receive buffer (#538). Messages arrive as WS 'message'
+    // frames (primary) and as the HTTP state response's `messages` array
+    // (fallback backfill); the two overlap, so entries are unioned on a
+    // from+text key — the HTTP entries carry no `to` field, so `to` cannot be
+    // part of the key, and it is stored only when the frame actually carried it
+    // (never fabricated: mislabeling a whisper as broadcast would mislead a
+    // social-deduction agent). Known limitations of the key: a player repeating
+    // an IDENTICAL statement is buffered once. Capped at MAX_BUFFERED_MESSAGES
+    // (oldest dropped). Owner-gated like the other shared-state mutations.
+    appendMessages(matchId, msgs) {
+      assertOwner();
+      if (!matchId || !Array.isArray(msgs) || msgs.length === 0) return 0;
+      let buf = SHARED.messagesByMatch.get(matchId);
+      if (!buf) {
+        buf = [];
+        SHARED.messagesByMatch.set(matchId, buf);
+      }
+      const keyOf = (m) => JSON.stringify([m.from, m.text]);
+      const seen = new Set(buf.map(keyOf));
+      let added = 0;
+      for (const m of msgs) {
+        if (!m || typeof m.text !== 'string') continue;
+        const entry =
+          m.to === undefined
+            ? { from: m.from, text: m.text }
+            : { from: m.from, text: m.text, to: m.to };
+        if (seen.has(keyOf(entry))) continue;
+        seen.add(keyOf(entry));
+        buf.push(entry);
+        added += 1;
+      }
+      if (buf.length > MAX_BUFFERED_MESSAGES) buf.splice(0, buf.length - MAX_BUFFERED_MESSAGES);
+      return added;
+    },
+
     attachMatch(sessionKey, matchId, gameId) {
       assertOwner();
       const binding = SHARED.bindings.get(sessionKey);
@@ -347,10 +393,17 @@ function makeCoordinator(api) {
           ? { status: 'game_over', matchId, ...outcome }
           : { status: 'game_over', matchId };
       }
+      // Discussion table talk rides every non-terminal read (#538) so the agent
+      // can catch up on chat both when acting and while waiting after its ready.
+      // Only the newest MAX_RESULT_MESSAGES resend (token cost); key omitted
+      // entirely when there is no chat.
+      const buffered = SHARED.messagesByMatch.get(matchId);
+      const messages =
+        buffered && buffered.length > 0 ? { messages: buffered.slice(-MAX_RESULT_MESSAGES) } : {};
       const turnToken = SHARED.currentTokenByMatch.get(matchId);
-      if (!turnToken) return { status: 'waiting', matchId };
+      if (!turnToken) return { status: 'waiting', matchId, ...messages };
       const rec = SHARED.tokens.get(turnToken);
-      if (!rec || rec.used) return { status: 'waiting', matchId };
+      if (!rec || rec.used) return { status: 'waiting', matchId, ...messages };
       return {
         status: 'your_turn',
         matchId,
@@ -359,6 +412,7 @@ function makeCoordinator(api) {
         gameId: rec.packet.gameId,
         phase: rec.packet.phase,
         view: rec.packet.view,
+        ...messages,
       };
     },
 
@@ -415,11 +469,27 @@ function makeCoordinator(api) {
         if (ack.status === 'game_over') {
           SHARED.terminalMatches.add(rec.matchId);
           SHARED.currentTokenByMatch.delete(rec.matchId);
+          SHARED.messagesByMatch.delete(rec.matchId);
           // Persist the outcome so a get_turn re-read after a self-ending move
           // also carries results/replayUrl, not just the transient take_turn ack (#510).
           const outcome = cleanOutcome(ack);
           if (outcome) SHARED.terminalOutcomes.set(rec.matchId, outcome);
           return { ok: true, ...ack };
+        }
+        if (action?.type === 'message') {
+          // Message actions are non-turn-consuming SERVER-side (the action route
+          // handles them without touching the game turn), so RELEASE the parked
+          // turn: the same token stays valid for the phase action. Without this
+          // a statement burns the single-use token and no re-park exists for the
+          // unchanged sequence (parkTurn dedupes) — the #538 murder-mystery trap
+          // (the participation floor makes a statement MANDATORY before ready).
+          rec.used = false;
+          return {
+            ok: true,
+            status: 'message_sent',
+            message:
+              'Statement delivered to the table. Your turn is still open and the same turnToken is still valid — call get_turn to see table messages, then submit your phase action (e.g. {type:"ready"}) with take_turn.',
+          };
         }
         // INVARIANT: take_turn never surfaces an actionable turn or a turnToken —
         // get_turn is the SOLE source of actionable turns + tokens (enqueueTurn is
@@ -444,6 +514,7 @@ function makeCoordinator(api) {
     markTerminal(matchId, outcome) {
       assertOwner();
       SHARED.terminalMatches.add(matchId);
+      SHARED.messagesByMatch.delete(matchId);
       // Capture the game-over outcome (opponent-ended / timeout / forfeit) so the
       // parked get_turn re-read surfaces results/replayUrl/reason (#510).
       const cleaned = cleanOutcome(outcome);
@@ -478,6 +549,7 @@ function makeCoordinator(api) {
           SHARED.transportByMatch.clear();
           SHARED.terminalMatches.clear();
           SHARED.terminalOutcomes.clear();
+          SHARED.messagesByMatch.clear();
           SHARED.pending = null;
           SHARED.owner = null;
           SHARED.ownerCoordinator = null;
@@ -521,7 +593,7 @@ export function makeGetTurnFactory(coordinator, { nextTurnBlockMs } = {}) {
   const blockSecs = Math.round(blockMs / 1000);
   return (ctx) => ({
     name: 'get_turn',
-    description: `Fetch your current SteamedClaw turn. This call WAITS up to ~${blockSecs}s for your turn to arrive, then returns status: "not_joined" (you have not queued — call queue_match first), "no_match" (still matchmaking — call again), "waiting" (matched, opponent's turn — call again), "your_turn" (act now: pass the returned turnToken to take_turn), or "game_over" (the match ended — stop). Just call it again whenever it returns no_match or waiting. ${PLAY_LOOP}`,
+    description: `Fetch your current SteamedClaw turn. This call WAITS up to ~${blockSecs}s for your turn to arrive, then returns status: "not_joined" (you have not queued — call queue_match first), "no_match" (still matchmaking — call again), "waiting" (matched, opponent's turn — call again), "your_turn" (act now: pass the returned turnToken to take_turn), or "game_over" (the match ended — stop). In discussion games (werewolf, murder-mystery) the result may also carry a "messages" array — the recent table talk; read it before acting (absent when nothing has been said). Just call it again whenever it returns no_match or waiting. ${PLAY_LOOP}`,
     parameters: { type: 'object', properties: {}, additionalProperties: false },
     async execute() {
       const sessionKey = ctx?.sessionKey;
@@ -537,8 +609,13 @@ export function makeGetTurnFactory(coordinator, { nextTurnBlockMs } = {}) {
         r.guidance =
           'Either call get_turn again, or stop — a heartbeat will wake you when it is your turn. When you wake from a heartbeat, call get_turn FIRST.';
       } else if (r.status === 'your_turn') {
-        r.guidance =
-          'Act now: call take_turn with this turnToken and one legal action, then call get_turn again.';
+        // Discussion phases (werewolf day_discussion, murder-mystery
+        // investigation_discuss) have a second, non-turn-consuming channel —
+        // teach it here, in the result, where the agent is looking (#538).
+        const inDiscussion = typeof r.view?.phase === 'string' && r.view.phase.includes('discuss');
+        r.guidance = inDiscussion
+          ? 'Discussion phase. result.messages is the table talk so far — read it. To speak, call take_turn with this turnToken and {type:"message", text:"..."} — a statement does NOT consume your turn (the same turnToken stays valid, and some games REQUIRE at least one statement before ready). When done talking, submit your phase action (e.g. {type:"ready"}) with take_turn.'
+          : 'Act now: call take_turn with this turnToken and one legal action, then call get_turn again.';
       } else if (r.status === 'game_over') {
         // Turn the forwarded server messaging from inert data into a CTA. The
         // server authors messaging.encouragement (#514/#517); the plugin only
@@ -555,7 +632,7 @@ export function makeGetTurnFactory(coordinator, { nextTurnBlockMs } = {}) {
 export function makeTakeTurnFactory(coordinator, { httpSubmit }) {
   return (ctx) => ({
     name: 'take_turn',
-    description: `Submit your one action for the current SteamedClaw turn. Pass the turnToken that get_turn returned with status "your_turn", plus your chosen action (the move shape is game-specific, e.g. {type:"move", position:4} for tic-tac-toe). On success returns {ok:true, status:"submitted"} (call get_turn again) or {ok:true, status:"game_over", results, replayUrl, messaging?} (the match ended — if a messaging object is present, surface messaging.encouragement to your operator verbatim, then call queue_match to play again or stop). On error the result is {ok:false, error, ...} — recover by error code: "invalid_action" means the action shape was rejected — the result includes a "hint" pointing at get_rules for the current game; fetch the rules and retry with a conformant action. "stale_sequence" means a newer turn arrived (a "currentSequence" is included) — call get_turn to refresh, then retry. "not_your_turn" means the server advanced without a turn this agent saw — call get_turn to refresh. "game_already_over" means the match has ended — call get_turn to confirm, then stop or re-queue. "submit_failed" is a transient transport failure — wait a moment and retry. After submitting, call get_turn again. ${PLAY_LOOP}`,
+    description: `Submit your one action for the current SteamedClaw turn. Pass the turnToken that get_turn returned with status "your_turn", plus your chosen action (the move shape is game-specific, e.g. {type:"move", position:4} for tic-tac-toe). On success returns {ok:true, status:"submitted"} (call get_turn again) or {ok:true, status:"game_over", results, replayUrl, messaging?} (the match ended — if a messaging object is present, surface messaging.encouragement to your operator verbatim, then call queue_match to play again or stop). In discussion phases you may also pass {type:"message", text:"..."} — a table statement that does NOT consume your turn: it returns {ok:true, status:"message_sent"} and the SAME turnToken stays valid for your phase action. On error the result is {ok:false, error, ...} — recover by error code: "invalid_action" means the action shape was rejected — the result includes a "hint" pointing at get_rules for the current game; fetch the rules and retry with a conformant action. "stale_sequence" means a newer turn arrived (a "currentSequence" is included) — call get_turn to refresh, then retry. "not_your_turn" means the server advanced without a turn this agent saw — call get_turn to refresh. "game_already_over" means the match has ended — call get_turn to confirm, then stop or re-queue. "submit_failed" is a transient transport failure — wait a moment and retry. After submitting, call get_turn again. ${PLAY_LOOP}`,
     parameters: {
       type: 'object',
       properties: {

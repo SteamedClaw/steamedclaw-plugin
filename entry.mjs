@@ -257,6 +257,16 @@ export function makeWsReceiver({ api, server, logger, makeWebSocket }) {
     })();
   }
 
+  function handleMessage(frame) {
+    try {
+      const owner = getOwnerCoordinator();
+      if (!owner || !DRIVER.matchId || DRIVER.phase === 'terminal') return;
+      owner.appendMessages(DRIVER.matchId, [frame]);
+    } catch (err) {
+      logger.warn?.(`[steamedclaw-plugin] message handler error: ${err?.message ?? err}`);
+    }
+  }
+
   function handleGameOver(frame) {
     try {
       const owner = getOwnerCoordinator();
@@ -289,6 +299,7 @@ export function makeWsReceiver({ api, server, logger, makeWebSocket }) {
         onMatchFound: handleMatchFound,
         onYourTurn: handleYourTurn,
         onGameOver: handleGameOver,
+        onMessage: handleMessage,
       });
     },
     status: receiverStatus,
@@ -423,6 +434,19 @@ export async function supervisorTick({ client, server, cfg, logger, receiver, ap
       });
       return 'idle'; //  game over — the supervisor keeps ticking for a re-queue
     }
+    if (st.status === 'discussion' && Array.isArray(st.messages) && st.messages.length > 0) {
+      // HTTP backfill of the discussion receive buffer (WS 'message' frames are
+      // the primary source; the state response repeats the table talk).
+      //
+      // Deliberately NOT parked as a turn: the 'discussion' status carries no
+      // "you still owe an action" signal (it reports for committed and even dead
+      // players, with a table-max fallback sequence), so parking it would mint
+      // phantom turns after our commit — including on the healthy-WS safety
+      // ticks. Discussion-turn DELIVERY therefore stays WS-only until the server
+      // exposes an awaiting-action signal on this state (#538 follow-up); the
+      // HTTP floor's inability to deliver discussion turns matches 1.0.x.
+      owner.appendMessages(DRIVER.matchId, st.messages);
+    }
     if (st.status === 'your_turn') {
       await parkTurn(owner, st, 'http', { api, logger });
     }
@@ -471,7 +495,7 @@ function makeSupervisorService(api, client, server, cfg, logger, receiver) {
 function makeRegisterTool({ client, server, logger, receiver }) {
   return () => ({
     name: 'register_agent',
-    description: `Register this agent with the SteamedClaw server. Pass {name, model?} — name is your agent identity (1-64 chars, letters/numbers/hyphens/spaces/underscores, immutable, unique across SteamedClaw); model is optional (your LLM model id for stats). Use your SOUL-defined identity for name. Returns {ok, id?, name?, apiKey?, claimUrl?, verificationCode?, operatorNotice?, error?, message?}. On ok:true surface the operatorNotice in your next message so the operator can claim this agent. On error='already_registered' credentials exist — skip and call queue_match. On error='name_taken' pick a different name. After registering, call queue_match to play.`,
+    description: `Register this agent with the SteamedClaw server. Pass {name, model?} — name is your agent identity (1-64 chars, letters/numbers/hyphens/spaces/underscores, immutable, unique across SteamedClaw); model is optional (your LLM model id for stats). Use your SOUL-defined identity for name. Returns {ok, id?, name?, claimUrl?, verificationCode?, operatorNotice?, error?, message?}. On ok:true surface the operatorNotice in your next message so the operator can claim this agent. On error='already_registered' credentials exist — skip and call queue_match. On error='name_taken' pick a different name. After registering, call queue_match to play.`,
     parameters: {
       type: 'object',
       properties: {
@@ -545,7 +569,11 @@ function makeRegisterTool({ client, server, logger, receiver }) {
               id: r.id,
               name,
               model: typeof model === 'string' && model.length > 0 ? model : null,
-              apiKey: r.apiKey,
+              // H1 (087 security review): the raw apiKey is deliberately NOT returned
+              // into the LLM tool result. The plugin already persisted it
+              // (writeCredentials) and set it on the client (setApiKey) above, so the
+              // agent never needs it in-context. claimUrl/verificationCode are the
+              // operator-claim surface (non-secret) and also live inside operatorNotice.
               claimUrl: r.claimUrl || null,
               verificationCode: r.verificationCode || null,
               operatorNotice,
