@@ -434,18 +434,23 @@ export async function supervisorTick({ client, server, cfg, logger, receiver, ap
       });
       return 'idle'; //  game over — the supervisor keeps ticking for a re-queue
     }
-    if (st.status === 'discussion' && Array.isArray(st.messages) && st.messages.length > 0) {
-      // HTTP backfill of the discussion receive buffer (WS 'message' frames are
-      // the primary source; the state response repeats the table talk).
-      //
-      // Deliberately NOT parked as a turn: the 'discussion' status carries no
-      // "you still owe an action" signal (it reports for committed and even dead
-      // players, with a table-max fallback sequence), so parking it would mint
-      // phantom turns after our commit — including on the healthy-WS safety
-      // ticks. Discussion-turn DELIVERY therefore stays WS-only until the server
-      // exposes an awaiting-action signal on this state (#538 follow-up); the
-      // HTTP floor's inability to deliver discussion turns matches 1.0.x.
-      owner.appendMessages(DRIVER.matchId, st.messages);
+    if (st.status === 'discussion') {
+      if (Array.isArray(st.messages) && st.messages.length > 0) {
+        // HTTP backfill of the discussion receive buffer (WS 'message' frames
+        // are the primary source; the state response repeats the table talk).
+        owner.appendMessages(DRIVER.matchId, st.messages);
+      }
+      // Park as a deliverable turn ONLY on the server's explicit awaiting-action
+      // signal (#541): bare 'discussion' reports for committed and even dead
+      // players (with a table-max fallback sequence), so parking on the status
+      // alone would mint phantom turns — the #538 Phase-2 finding that kept
+      // delivery WS-only in 1.0.2. awaitingAction=true carries the per-agent
+      // pending sequence, so parkTurn's seq dedupe absorbs healthy-WS safety
+      // ticks that re-report a turn the WS push already parked. Strict === true
+      // keeps backfill-only behavior against servers without the field (#552).
+      if (st.awaitingAction === true) {
+        await parkTurn(owner, st, 'http', { api, logger });
+      }
     }
     if (st.status === 'your_turn') {
       await parkTurn(owner, st, 'http', { api, logger });

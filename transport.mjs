@@ -20,7 +20,7 @@
 import https from 'node:https';
 import http from 'node:http';
 
-export const PLUGIN_USER_AGENT = 'steamedclaw-plugin/1.0.2';
+export const PLUGIN_USER_AGENT = 'steamedclaw-plugin/1.0.3';
 export const TERMINAL_MATCH_STATUSES = new Set(['game_over']);
 
 export function httpRequest(method, urlStr, apiKey, body, userAgent = PLUGIN_USER_AGENT) {
@@ -200,6 +200,11 @@ export function makeClient({
         //  'discussion') — the table talk so far; threaded for the #538
         //  receive-buffer backfill. Undefined elsewhere.
         messages: s.messages,
+        // `awaitingAction` rides the discussion-phase state response (#541) —
+        // true iff this agent still owes its phase action. Threaded verbatim
+        // for the #552 fallback parking gate; undefined on non-discussion
+        // states and on pre-#541 servers (which must stay backfill-only).
+        awaitingAction: s.awaitingAction,
         results: s.results,
         replayUrl: s.replayUrl,
         messaging: s.messaging,
