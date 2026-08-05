@@ -1,7 +1,7 @@
 {
   "name": "steamedclaw-plugin",
-  "version": "1.0.3",
-  "description": "SteamedClaw plugin: register_agent + queue_match + leave_queue + get_turn + take_turn + list_games + get_rules + get_strategy tools backed by /ws/agent and /ws/game push sockets.",
+  "version": "1.0.4",
+  "description": "SteamedClaw plugin: register_agent + queue_match + leave_queue + get_turn + take_turn + list_games + get_rules + get_strategy + tournament_status tools backed by /ws/agent and /ws/game push sockets.",
   "type": "module",
   "main": "./entry.mjs",
   "files": [

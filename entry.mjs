@@ -47,6 +47,9 @@ export const MAX_SIMULTANEOUS_GAMES = 1;
 
 const DEFAULT_TICK_MS = 4000; //  supervisor cadence; WS events do the fast path
 const DEFAULT_RATE_LIMIT_BACKOFF_MS = 3000; //  floor backoff on a 429
+// tournament_status 429 backoff cap: the wait is retry-after-honoring but
+// bounded — a tool call must return in seconds, not sit on a huge Retry-After.
+const TOURNAMENT_RETRY_CAP_MS = 15000;
 const DEFAULT_NEXT_TURN_BLOCK_MS = 20000; //  blocking get_turn budget
 // HTTP safety-net cadence while the WS path is healthy: every Nth tick still
 // runs discovery/state polling to catch events lost outside the 60s missed-event
@@ -777,6 +780,190 @@ function makeInfoTools({ client }) {
   ];
 }
 
+// ── tournament_status (#426): read-only tournament awareness ─────────────────
+// Entry is deliberately NOT exposed: registration is an owner act on the portal
+// (planning/063 §9.3 re-scope, 2026-08-05). The tool only reads. The entered
+// view is assembled from the public reads (/schedule, /pairings, /standings)
+// because /me carries entry fields only; every server shape passes through
+// verbatim. Unregistered agents still get discovery — /active is public.
+
+// Mirrors the server's LIVE_STAGE_ORDER: when rounds of several stages are
+// open, the later stage is the one the agent is playing in.
+const TOURNAMENT_STAGE_ORDER = { qualifying: 0, seeding: 1, bracket: 2, shootout: 3 };
+// Pool stages open ONE round PER POOL concurrently (roundNumber encodes
+// stageIndex*1000+poolIndex), so finding this agent's round means scanning the
+// open rounds' pairing lists. Cap the scan so a huge pool count can't turn one
+// tool call into an unbounded request storm (pilot scale: ≤16 pools).
+const TOURNAMENT_POOL_SCAN_CAP = 16;
+
+function makeTournamentStatusTool({ client, server, sleep }) {
+  const wait = sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+
+  function readFailure(res) {
+    if (res.httpStatus === 429) {
+      return {
+        ok: false,
+        error: 'rate_limited',
+        retryAfterMs: res.retryAfterMs,
+        message:
+          'SteamedClaw is rate-limiting requests. Wait a few seconds, then call tournament_status again.',
+      };
+    }
+    return { ok: false, error: 'tournament_lookup_failed', httpStatus: res.httpStatus };
+  }
+
+  return () => ({
+    name: 'tournament_status',
+    description: `Check SteamedClaw tournament status — read-only awareness. No parameters; example call: tournament_status(). Returns {ok, state, ...} where state is one of: "none_active" — no tournament running; "not_registered" — a tournament exists (summary included) but you have no SteamedClaw registration (entry requires a registered agent your owner has claimed); "not_entered" — tournament summary + enterUrl: entry happens ONLY on the owner portal, so tell your OWNER to visit enterUrl (you cannot enter); "entered" — your entry plus round (stage, roundNumber, window times), pairings (your matchups this round: opponent id and name, bestOfN, matchIds, outcome — empty in table formats), and standing (your rank row); "withdrawn" — you were entered but withdrew. This tool does NOT enter or withdraw you from tournaments and does not play matches — entry is an owner action on the portal, and tournament matches arrive automatically as normal match_found pushes (play them via get_turn and take_turn as usual). On error:"rate_limited", wait a few seconds and call again.`,
+    parameters: { type: 'object', properties: {}, additionalProperties: false },
+    async execute() {
+      // Bounded 429 handling (feedback_http_client_handle_429): ONE floored,
+      // capped wait + ONE retry PER TOOL CALL — never a loop, and waits never
+      // stack across the up-to-many sub-reads (a second 429 after the budget is
+      // spent surfaces immediately as a structured rate_limited result).
+      let backoffSpent = false;
+      const readWithRetry = async (fn) => {
+        const first = await fn();
+        if (first.ok || first.httpStatus !== 429 || backoffSpent) return first;
+        backoffSpent = true;
+        const ms = Math.min(
+          Math.max(first.retryAfterMs ?? 0, DEFAULT_RATE_LIMIT_BACKOFF_MS),
+          TOURNAMENT_RETRY_CAP_MS,
+        );
+        await wait(ms);
+        return fn();
+      };
+
+      try {
+        const creds = readCredentials();
+        if (creds) client.setApiKey(creds.apiKey);
+
+        const active = await readWithRetry(() => client.tournamentActive());
+        if (!active.ok) return toolText(readFailure(active));
+        if (!active.tournament) {
+          return toolText({
+            ok: true,
+            state: 'none_active',
+            message: 'No SteamedClaw tournament is currently active or announced.',
+          });
+        }
+        const t = active.tournament;
+
+        if (!creds) {
+          return toolText({
+            ok: true,
+            state: 'not_registered',
+            tournament: t,
+            note: 'A tournament exists but you are not registered on SteamedClaw. Entering requires a registered agent that your owner has CLAIMED, and entry itself is done by the owner on the portal. Call register_agent, surface the claim link to your owner, and tell them about this tournament.',
+          });
+        }
+
+        const me = await readWithRetry(() => client.tournamentMe(t.id));
+        if (!me.ok) return toolText(readFailure(me));
+        if (!me.entry) {
+          return toolText({
+            ok: true,
+            state: 'not_entered',
+            tournament: t,
+            enterUrl: `${server}/tournaments/${t.number}/enter`,
+            note: 'You are not entered. Entry is owner-only: your OWNER enters you on the SteamedClaw portal at the enterUrl — you cannot enter yourself. Tell your owner about this tournament.',
+          });
+        }
+        if (me.entry.withdrawnAt != null) {
+          // Withdrawn entries ride the same /me response; round/opponent lookups
+          // would mislead (the agent no longer plays), so report and stop.
+          return toolText({ ok: true, state: 'withdrawn', tournament: t, entry: me.entry });
+        }
+
+        // Entered: best-effort assembly — a failed sub-read nulls its field
+        // rather than failing the whole status (429s still surface, above).
+        //
+        // Round attribution: single-round stages (seeding/bracket/shootout) have
+        // one open round — it IS the agent's round. Pool stages open one round
+        // PER POOL at once, so the agent's round is the one whose pairing list
+        // contains it — scan the open rounds of the latest open stage (capped)
+        // and keep EVERY pairing of the agent's in that round (round-robin pools
+        // pair an agent against each pool-mate in the same round).
+        let round = null;
+        let myPairingRows = null;
+        const sched = await readWithRetry(() => client.tournamentSchedule(t.id));
+        if (!sched.ok && sched.httpStatus === 429) return toolText(readFailure(sched));
+        if (sched.ok) {
+          const open = sched.rounds.filter((r) => r?.status === 'open');
+          if (open.length > 0) {
+            const topStage = open.reduce((best, r) =>
+              (TOURNAMENT_STAGE_ORDER[r.stage] ?? -1) > (TOURNAMENT_STAGE_ORDER[best.stage] ?? -1)
+                ? r
+                : best,
+            ).stage;
+            const candidates = open
+              .filter((r) => r.stage === topStage)
+              .sort((a, b) => a.roundNumber - b.roundNumber)
+              .slice(0, TOURNAMENT_POOL_SCAN_CAP);
+            if (candidates.length === 1) {
+              // Exactly one open round: the agent's round even when its pairing
+              // list is empty (table formats put seats in tables, not pairings).
+              round = candidates[0];
+            }
+            for (const r of candidates) {
+              const pr = await readWithRetry(() =>
+                client.tournamentPairings(t.id, r.roundNumber, r.stage),
+              );
+              if (!pr.ok && pr.httpStatus === 429) return toolText(readFailure(pr));
+              if (!pr.ok) break; //  best-effort: stop the scan on a hard failure
+              const mine = pr.pairings.filter(
+                (p) => p?.agentAId === creds.agentId || p?.agentBId === creds.agentId,
+              );
+              if (mine.length > 0) {
+                round = r;
+                myPairingRows = mine;
+                break;
+              }
+            }
+          }
+        }
+
+        const stand = await readWithRetry(() => client.tournamentStandings(t.id));
+        if (!stand.ok && stand.httpStatus === 429) return toolText(readFailure(stand));
+        const rows = stand.ok ? stand.standings : [];
+        const standing = rows.find((row) => row?.agentId === creds.agentId) ?? null;
+
+        const pairings = (myPairingRows ?? []).map((p) => {
+          const opponentAgentId = p.agentAId === creds.agentId ? p.agentBId : p.agentAId;
+          return {
+            pairingId: p.pairingId,
+            opponentAgentId,
+            // Display name resolved from the standings rows (the pairing
+            // payload carries ids only); null when the opponent has no row.
+            opponentName: rows.find((row) => row?.agentId === opponentAgentId)?.agentName ?? null,
+            bestOfN: p.bestOfN,
+            matchIds: p.matchIds,
+            outcome: p.outcome,
+          };
+        });
+
+        return toolText({
+          ok: true,
+          state: 'entered',
+          tournament: t,
+          entry: me.entry,
+          round,
+          pairings,
+          standing,
+        });
+      } catch (err) {
+        // A transport-level failure (timeout, connection refused) rejects the
+        // underlying request — surface it structured instead of throwing raw.
+        return toolText({
+          ok: false,
+          error: 'tournament_status_failed',
+          message: String(err?.message ?? err),
+        });
+      }
+    },
+  });
+}
+
 // ── Plugin registration ──────────────────────────────────────────────────────
 export function registerPlugin(api, opts = {}) {
   const cfg = { ...(api.pluginConfig ?? {}) }; //  local copy — never mutate api.pluginConfig
@@ -815,6 +1002,10 @@ export function registerPlugin(api, opts = {}) {
   api.registerTool(infoFactories[0], { name: 'list_games' });
   api.registerTool(infoFactories[1], { name: 'get_rules' });
   api.registerTool(infoFactories[2], { name: 'get_strategy' });
+  // opts.sleep lets tests observe the 429 backoff without real delays.
+  api.registerTool(makeTournamentStatusTool({ client, server, sleep: opts.sleep }), {
+    name: 'tournament_status',
+  });
 
   // Supervisor service — full mode only.
   if (api.registrationMode === 'full') {

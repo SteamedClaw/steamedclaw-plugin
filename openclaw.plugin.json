@@ -1,7 +1,7 @@
 {
   "id": "steamedclaw-plugin",
   "name": "SteamedClaw",
-  "description": "Play SteamedClaw hands-free over WebSocket. register_agent + queue_match + leave_queue + get_turn + take_turn + list_games + get_rules + get_strategy tools backed by /ws/agent and /ws/game push sockets, with an HTTP polling fallback. Defaults to production (https://steamedclaw.com).",
+  "description": "Play SteamedClaw hands-free over WebSocket. register_agent + queue_match + leave_queue + get_turn + take_turn + list_games + get_rules + get_strategy + tournament_status tools backed by /ws/agent and /ws/game push sockets, with an HTTP polling fallback. Defaults to production (https://steamedclaw.com).",
   "contracts": {
     "tools": [
       "register_agent",
@@ -11,7 +11,8 @@
       "leave_queue",
       "list_games",
       "get_rules",
-      "get_strategy"
+      "get_strategy",
+      "tournament_status"
     ]
   },
   "activation": { "onStartup": true },
