@@ -42,6 +42,8 @@ const SHARED = {
   transportByMatch: new Map(), //  matchId -> { isOpen(): bool, submit(frame): Promise<ack> } — dormant Leg-2 seam
   terminalMatches: new Set(), //  matchId set after game_over
   terminalOutcomes: new Map(), //  matchId -> { results?, replayUrl?, reason? } captured at game_over (#510)
+  deliveredOutcomes: new Set(), //  matchId whose terminal outcome reached an AGENT-FACING tool result (#663 carryover gate)
+  carryover: null, //  { matchId, outcome } — an undelivered terminal envelope displaced by adoption (#663)
   messagesByMatch: new Map(), //  matchId -> [{from, text, to}] — discussion receive buffer (#538)
   pending: null, //  single shared pending-action slot: { matchId, turnToken }
   owner: null, //  generation of the live full-mode coordinator (fence)
@@ -102,6 +104,8 @@ export function __resetState() {
   SHARED.transportByMatch.clear();
   SHARED.terminalMatches.clear();
   SHARED.terminalOutcomes.clear();
+  SHARED.deliveredOutcomes.clear();
+  SHARED.carryover = null;
   SHARED.messagesByMatch.clear();
   SHARED.pending = null;
   SHARED.owner = null;
@@ -111,13 +115,17 @@ export function __resetState() {
 }
 
 // Build a clean terminal-outcome object from a source that carries some of
-// { results, replayUrl, reason, messaging } — dropping undefined keys so a bare
+// { results, replayUrl, reason, messaging, nextGameAssigned } — dropping
+// undefined keys so a bare
 // game_over (nothing captured) never surfaces phantom `results:undefined` etc. (#510).
 // `reason` is best-effort: WS game_over frames carry it; the HTTP state endpoint
 // does not (it always reports status:'game_over'), matching 0.9.x's HTTP path.
 // `messaging` is the server-authored end-of-game envelope ({teaser?, encouragement},
 // #514) — forwarded as ONE object so a future reserved field (analysis) lands for
 // free; the plugin never authors, replaces, or cherry-picks its text (#517).
+// `nextGameAssigned` (#663) is the server's structured don't-re-queue signal
+// (true only while the agent's tournament run continues); captured so the
+// game_over guidance below can key on STRUCTURE, never on parsing server text.
 function cleanOutcome(source) {
   if (!source || typeof source !== 'object') return null;
   const out = {};
@@ -125,7 +133,70 @@ function cleanOutcome(source) {
   if (source.replayUrl !== undefined) out.replayUrl = source.replayUrl;
   if (source.reason !== undefined) out.reason = source.reason;
   if (source.messaging !== undefined) out.messaging = source.messaging;
+  if (source.nextGameAssigned !== undefined) out.nextGameAssigned = source.nextGameAssigned;
   return Object.keys(out).length > 0 ? out : null;
+}
+
+// ── #663 carryover: terminal-envelope preservation across adoption ───────────
+// Adoption (entry.mjs adoptMatch — a tournament series game 2..N or the next
+// round replacing a finished match with NO tool call in between) swaps the
+// tracked match BEFORE the agent may have fetched the finished game's final
+// state. Without capture, that game's end-of-game envelope (results/replayUrl/
+// reason + the server-authored messaging envelope, #514/#517) is silently lost:
+// the binding flips to the new match and nextTurn never reports the old
+// game_over again. These helpers preserve EXACTLY-ONCE delivery:
+//   - a game_over that reached an AGENT-FACING tool result WITH its outcome
+//     marks the match delivered (get_turn result / take_turn game_over ack).
+//     The supervisor's internal nextTurn reads are not agent-facing and never
+//     mark. A bare game_over (no envelope captured yet — e.g. the
+//     game_already_over rejection path) does not count as delivery either, so
+//     a later-captured envelope can still carry over.
+//   - adoptMatch captures the outgoing match's outcome only when NOT delivered.
+//   - the adopted match's first agent-facing response (queue_match 'matched' on
+//     the C path; the first get_turn otherwise) consumes the slot and forwards
+//     the envelope VERBATIM as previousMatchResult (passthrough preserved —
+//     the plugin never authors, edits, or cherry-picks the content).
+// Single slot (v1 single-match): if a second adoption displaces ANOTHER
+// undelivered envelope before the first was consumed (two consecutive games
+// finished with zero agent contact), the newer envelope wins; the block always
+// names its matchId, so attribution stays correct.
+
+export function markOutcomeDelivered(matchId) {
+  //  Only an outcome-carrying result counts as delivery (see block comment).
+  if (!matchId || !SHARED.terminalOutcomes.has(matchId)) return;
+  SHARED.deliveredOutcomes.add(matchId);
+  if (SHARED.carryover?.matchId === matchId) SHARED.carryover = null; //  delivered normally pre-attach — drop the pending copy
+}
+
+export function captureUndeliveredOutcome(matchId) {
+  if (!matchId || SHARED.deliveredOutcomes.has(matchId)) return;
+  const outcome = SHARED.terminalOutcomes.get(matchId);
+  if (!outcome) return; //  nothing captured at terminal — nothing to carry
+  SHARED.carryover = { matchId, outcome };
+}
+
+// Consume-once: returns the pending block (and marks it delivered) only when a
+// carryover exists for a DIFFERENT match than the one being responded about —
+// the old match's own game_over read is normal delivery, not carryover.
+export function takeCarryover(currentMatchId) {
+  const c = SHARED.carryover;
+  if (!c || !currentMatchId || c.matchId === currentMatchId) return null;
+  SHARED.carryover = null;
+  SHARED.deliveredOutcomes.add(c.matchId);
+  return { matchId: c.matchId, ...c.outcome }; //  the stored envelope, verbatim
+}
+
+// Structural framing for a delivered carryover block (no server text is
+// authored or rewritten — the same verbatim-surface CTA the game_over guidance
+// uses). Shared by get_turn and the queue_match C-path result.
+// #663 hierarchy note: carryover fires exactly in mid-series adoption, so the
+// carried envelope usually says "do not queue — your next game is assigned
+// automatically" (and carries nextGameAssigned, preserved verbatim). That was
+// true when it was written — the adopted CURRENT match IS that next game — so
+// the closing clause pins precedence structurally: the current result governs
+// what to do next; the carried text is history, never a competing instruction.
+export function carryoverGuidance(prev) {
+  return `A previous match (${prev.matchId}) ended before you fetched its result. previousMatchResult is that match's final result; if it contains a messaging object, surface messaging.encouragement to your operator verbatim. previousMatchResult describes that earlier match only — for what to do next, follow this result's current status and guidance.`;
 }
 
 // get_rules recovery hint surfaced on a server invalid_action (#511, ported from
@@ -153,8 +224,11 @@ function mapServerRejection(ack, rec) {
     return {
       ok: false,
       error: 'game_already_over',
+      // #663: no unconditional re-queue nudge here — this path cannot see the
+      // server's run state; the get_turn game_over result carries the correct
+      // (tournament-aware) next step.
       message:
-        'The match has already ended on the server. Call get_turn to confirm, then stop or re-queue.',
+        "The match has already ended on the server. Call get_turn to confirm, then follow that result's guidance.",
     };
   }
   rec.used = false; //  recoverable — the parked turn survives for a corrected re-submit
@@ -473,7 +547,12 @@ function makeCoordinator(api) {
           // Persist the outcome so a get_turn re-read after a self-ending move
           // also carries results/replayUrl, not just the transient take_turn ack (#510).
           const outcome = cleanOutcome(ack);
-          if (outcome) SHARED.terminalOutcomes.set(rec.matchId, outcome);
+          if (outcome) {
+            SHARED.terminalOutcomes.set(rec.matchId, outcome);
+            // #663: the ack returned below carries the envelope to the agent —
+            // this IS agent-facing delivery, so adoption must not re-carry it.
+            SHARED.deliveredOutcomes.add(rec.matchId);
+          }
           return { ok: true, ...ack };
         }
         if (action?.type === 'message') {
@@ -549,6 +628,8 @@ function makeCoordinator(api) {
           SHARED.transportByMatch.clear();
           SHARED.terminalMatches.clear();
           SHARED.terminalOutcomes.clear();
+          SHARED.deliveredOutcomes.clear();
+          SHARED.carryover = null;
           SHARED.messagesByMatch.clear();
           SHARED.pending = null;
           SHARED.owner = null;
@@ -599,6 +680,14 @@ export function makeGetTurnFactory(coordinator, { nextTurnBlockMs } = {}) {
       const sessionKey = ctx?.sessionKey;
       if (!sessionKey) return toolText({ ok: false, error: 'no_session' });
       const r = await coordinator.nextTurnWait(sessionKey, blockMs);
+      // #663 carryover, in delivery order: (1) an outcome-carrying game_over in
+      // THIS result marks that match delivered (clearing a pending carryover for
+      // it — the pre-attach normal-delivery window); (2) a response about a
+      // DIFFERENT match than a pending carryover's consumes the slot and
+      // forwards the displaced envelope verbatim as previousMatchResult.
+      if (r.status === 'game_over' && r.matchId) markOutcomeDelivered(r.matchId);
+      const carried = takeCarryover(r.matchId);
+      if (carried) r.previousMatchResult = carried;
       // Teach the loop EXIT and RE-ENTRY, not just the loop (072j §9): an agent
       // that stops on 'waiting' is woken by a bare heartbeat carrying no context
       // — the result text is the only place to pre-load what that wake means.
@@ -621,8 +710,26 @@ export function makeGetTurnFactory(coordinator, { nextTurnBlockMs } = {}) {
         // server authors messaging.encouragement (#514/#517); the plugin only
         // frames it structurally here — surface it verbatim, then play again or
         // stop. (No server text is authored/rewritten — passthrough preserved.)
+        //
+        // #663 guidance hierarchy: server tournament messaging > server normal
+        // messaging > this client guidance — the client line must never
+        // contradict the layers above. `nextGameAssigned === true` is the
+        // server's STRUCTURED "run continues" signal (keyed on, never parsed
+        // from messaging text): while it is set, the queue_match nudge is
+        // wrong (the orchestrator assigns the next game and this plugin adopts
+        // it automatically), so the guidance routes back to get_turn instead.
+        // Absent (non-tournament, run over, pre-#663 server) the guidance is
+        // byte-identical to before.
         r.guidance =
-          'The match is over. If a messaging object is present, surface messaging.encouragement to your operator verbatim. To play again, call queue_match; otherwise stop calling SteamedClaw tools.';
+          r.nextGameAssigned === true
+            ? 'The match is over, but your tournament run continues: the server assigns your next game automatically and this plugin picks it up — do NOT call queue_match. If a messaging object is present, surface messaging.encouragement to your operator verbatim. Then call get_turn again, or stop — a heartbeat will wake you when your next game needs you.'
+            : 'The match is over. If a messaging object is present, surface messaging.encouragement to your operator verbatim. To play again, call queue_match; otherwise stop calling SteamedClaw tools.';
+      }
+      if (carried) {
+        //  Structural framing only — prepend the carryover CTA to the status guidance.
+        r.guidance = r.guidance
+          ? `${carryoverGuidance(carried)} ${r.guidance}`
+          : carryoverGuidance(carried);
       }
       return toolText({ ok: true, ...r });
     },
@@ -632,7 +739,7 @@ export function makeGetTurnFactory(coordinator, { nextTurnBlockMs } = {}) {
 export function makeTakeTurnFactory(coordinator, { httpSubmit }) {
   return (ctx) => ({
     name: 'take_turn',
-    description: `Submit your one action for the current SteamedClaw turn. Pass the turnToken that get_turn returned with status "your_turn", plus your chosen action (the move shape is game-specific, e.g. {type:"move", position:4} for tic-tac-toe). On success returns {ok:true, status:"submitted"} (call get_turn again) or {ok:true, status:"game_over", results, replayUrl, messaging?} (the match ended — if a messaging object is present, surface messaging.encouragement to your operator verbatim, then call queue_match to play again or stop). In discussion phases you may also pass {type:"message", text:"..."} — a table statement that does NOT consume your turn: it returns {ok:true, status:"message_sent"} and the SAME turnToken stays valid for your phase action. On error the result is {ok:false, error, ...} — recover by error code: "invalid_action" means the action shape was rejected — the result includes a "hint" pointing at get_rules for the current game; fetch the rules and retry with a conformant action. "stale_sequence" means a newer turn arrived (a "currentSequence" is included) — call get_turn to refresh, then retry. "not_your_turn" means the server advanced without a turn this agent saw — call get_turn to refresh. "game_already_over" means the match has ended — call get_turn to confirm, then stop or re-queue. "submit_failed" is a transient transport failure — wait a moment and retry. After submitting, call get_turn again. ${PLAY_LOOP}`,
+    description: `Submit your one action for the current SteamedClaw turn. Pass the turnToken that get_turn returned with status "your_turn", plus your chosen action (the move shape is game-specific, e.g. {type:"move", position:4} for tic-tac-toe). On success returns {ok:true, status:"submitted"} (call get_turn again) or {ok:true, status:"game_over", results, replayUrl, messaging?, nextGameAssigned?} (the match ended — if a messaging object is present, surface messaging.encouragement to your operator verbatim; if the result carries nextGameAssigned:true your tournament run continues and the server assigns your next game automatically — do NOT call queue_match, call get_turn instead; otherwise call queue_match to play again or stop). In discussion phases you may also pass {type:"message", text:"..."} — a table statement that does NOT consume your turn: it returns {ok:true, status:"message_sent"} and the SAME turnToken stays valid for your phase action. On error the result is {ok:false, error, ...} — recover by error code: "invalid_action" means the action shape was rejected — the result includes a "hint" pointing at get_rules for the current game; fetch the rules and retry with a conformant action. "stale_sequence" means a newer turn arrived (a "currentSequence" is included) — call get_turn to refresh, then retry. "not_your_turn" means the server advanced without a turn this agent saw — call get_turn to refresh. "game_already_over" means the match has ended — call get_turn to confirm, then follow that result's guidance. "submit_failed" is a transient transport failure — wait a moment and retry. After submitting, call get_turn again. ${PLAY_LOOP}`,
     parameters: {
       type: 'object',
       properties: {
@@ -650,6 +757,14 @@ export function makeTakeTurnFactory(coordinator, { httpSubmit }) {
       if (!sessionKey) return toolText({ ok: false, error: 'no_session' });
       const { turnToken, action } = args ?? {};
       const r = await coordinator.submitAction(sessionKey, turnToken, action, httpSubmit);
+      // #663 guidance hierarchy: a self-ending move's game_over ack can carry
+      // the server's structured "run continues" signal — mirror the get_turn
+      // routing so no surface tells a live tournament entrant to re-queue.
+      // Absent the signal, the ack is byte-identical to before.
+      if (r?.status === 'game_over' && r.nextGameAssigned === true) {
+        r.guidance =
+          'Your tournament run continues: the server assigns your next game automatically and this plugin picks it up — do NOT call queue_match. If a messaging object is present, surface messaging.encouragement to your operator verbatim, then call get_turn again.';
+      }
       return toolText(r);
     },
   });

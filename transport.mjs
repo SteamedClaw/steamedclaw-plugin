@@ -17,7 +17,7 @@
 //   GET  /api/tournaments/active           -> tournament summary | 404 no_active_tournament
 //   GET  /api/tournaments/:id/me           -> entry status | 404 entry_not_found
 //   GET  /api/tournaments/:id/schedule     -> {rounds:[...]}
-//   GET  /api/tournaments/:id/pairings/:round?stage= -> {pairings:[...]}
+//   GET  /api/tournaments/:id/series/:round?stage=&poolStage= -> {series:[...]}
 //   GET  /api/tournaments/:id/standings    -> {stage, standings:[...]}
 // Auth: Bearer <apiKey> on everything except register + list_games (and the
 // public tournament reads, which send it only when a key exists). The UA marks
@@ -26,7 +26,7 @@
 import https from 'node:https';
 import http from 'node:http';
 
-export const PLUGIN_USER_AGENT = 'steamedclaw-plugin/1.0.4';
+export const PLUGIN_USER_AGENT = 'steamedclaw-plugin/1.0.5';
 export const TERMINAL_MATCH_STATUSES = new Set(['game_over']);
 
 export function httpRequest(method, urlStr, apiKey, body, userAgent = PLUGIN_USER_AGENT) {
@@ -157,7 +157,10 @@ export function makeClient({
     // passive pairing + fast match-start (matchmakingStatus only reports a match
     // while it is "pending" pre-start; once the counterparty starts it the
     // pending entry clears and status returns not_queued, but the agent's match
-    // list still shows the live match). Returns the newest unfinished match.
+    // list still shows the live match). Returns the newest unfinished match's
+    // id + gameId (the gameId feeds #663 post-terminal adoption, where the
+    // discovered match — a tournament series game — is not tied to whatever
+    // the agent last queued).
     async activeMatch(agentId, gameId) {
       if (!agentId) return { ok: false, error: 'no_agent_id' };
       const res = await call('GET', `/api/agents/${encodeURIComponent(agentId)}/matches?limit=5`);
@@ -176,7 +179,7 @@ export function makeClient({
           !x.finishedAt &&
           (x.status === 'active' || x.status === 'waiting' || x.status === 'not_started'),
       );
-      return { ok: true, matchId: m ? m.id : null };
+      return { ok: true, matchId: m ? m.id : null, gameId: m ? (m.gameId ?? null) : null };
     },
 
     async getState(matchId) {
@@ -214,6 +217,12 @@ export function makeClient({
         results: s.results,
         replayUrl: s.replayUrl,
         messaging: s.messaging,
+        // `nextGameAssigned` rides the game-over state response (#663): true
+        // while this agent's tournament run continues (the server assigns the
+        // next game — the agent must NOT re-queue). Threaded verbatim so the
+        // coordinator's game_over guidance can key on it; undefined on
+        // non-terminal states, non-tournament matches, and pre-#663 servers.
+        nextGameAssigned: s.nextGameAssigned,
       };
     },
 
@@ -236,11 +245,14 @@ export function makeClient({
           // The terminal /action response wraps buildGameOverResponse in `state`,
           // so the server messaging envelope (#514) rides on st.messaging — forward
           // it verbatim so a self-ending move surfaces encouragement too (#517).
+          // `nextGameAssigned` (#663) rides the same terminal state: threaded so
+          // the take_turn game_over ack carries the don't-re-queue signal too.
           return {
             status: 'game_over',
             results: st.results,
             replayUrl: st.replayUrl,
             messaging: st.messaging,
+            nextGameAssigned: st.nextGameAssigned,
           };
         }
         return { status: st.status, sequence: st.sequence, view: st.view };
@@ -354,17 +366,22 @@ export function makeClient({
       return { ok: true, rounds: Array.isArray(res.data?.rounds) ? res.data.rounds : [] };
     },
 
-    // GET /api/tournaments/:id/pairings/:round?stage= — pairings for a round.
-    // Round numbers are only unique per (tournament, stage), so the stage from
-    // the schedule row is passed explicitly. A 404 (round gone between the
-    // schedule read and this one) maps to an empty pairing list.
-    async tournamentPairings(tournamentId, round, stage) {
-      const stageQuery = stage ? `?stage=${encodeURIComponent(stage)}` : '';
+    // GET /api/tournaments/:id/series/:round?stage=&poolStage= — the round's
+    // series (#646: the Bo-N unit; the union across the stage-round's pools,
+    // each row tagged poolIndex). Round numbers are plain and only unique per
+    // (stage, pool), so the stage — and, when the schedule row carries one,
+    // the poolStage index — are passed explicitly. A 404 (round gone between
+    // the schedule read and this one) maps to an empty series list.
+    async tournamentSeries(tournamentId, round, stage, poolStage) {
+      const params = [];
+      if (stage) params.push(`stage=${encodeURIComponent(stage)}`);
+      if (poolStage != null) params.push(`poolStage=${encodeURIComponent(poolStage)}`);
+      const query = params.length > 0 ? `?${params.join('&')}` : '';
       const res = await call(
         'GET',
-        `/api/tournaments/${encodeURIComponent(tournamentId)}/pairings/${encodeURIComponent(round)}${stageQuery}`,
+        `/api/tournaments/${encodeURIComponent(tournamentId)}/series/${encodeURIComponent(round)}${query}`,
       );
-      if (res.status === 404) return { ok: true, pairings: [] };
+      if (res.status === 404) return { ok: true, series: [] };
       if (res.status !== 200) {
         return {
           ok: false,
@@ -373,7 +390,7 @@ export function makeClient({
           retryAfterMs: res.data?.retryAfterMs,
         };
       }
-      return { ok: true, pairings: Array.isArray(res.data?.pairings) ? res.data.pairings : [] };
+      return { ok: true, series: Array.isArray(res.data?.series) ? res.data.series : [] };
     },
 
     // GET /api/tournaments/:id/standings — stage-aware standings (agent names

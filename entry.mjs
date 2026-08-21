@@ -19,7 +19,13 @@
 // Mechanics live in tool descriptions/results, never in agent SOUL/persona.
 
 import { definePluginEntry } from 'openclaw/plugin-sdk/plugin-entry';
-import { register as registerCoordinator, getOwnerCoordinator } from './coordinator.mjs';
+import {
+  register as registerCoordinator,
+  getOwnerCoordinator,
+  captureUndeliveredOutcome,
+  takeCarryover,
+  carryoverGuidance,
+} from './coordinator.mjs';
 import { makeClient, TERMINAL_MATCH_STATUSES } from './transport.mjs';
 import { readCredentials, writeCredentials, writeClaimIfAbsent } from './state.mjs';
 import {
@@ -225,16 +231,44 @@ function buildReport() {
   };
 }
 
+// Adopt a server-created match as the tracked match (#663). Tournament matches
+// bypass matchmaking — the tournament service creates them directly and pushes
+// match_found — and a Bo-N series delivers game 2..N (and each later round's
+// game) as a fresh match with NO queue_match call in between. Adoption runs the
+// same per-match reset the queue tool's fresh-queue block performs; the
+// lastParkedSeq/parkedVia/matchGameId reset is load-bearing — without it,
+// parkTurn's sequence dedupe silently drops the new game's low sequences.
+// Phase moves to 'queued' so the supervisor's attach block (or the WS handler's
+// inline attach) completes the attach + game-socket open.
+function adoptMatch(matchId, gameId) {
+  // #663 carryover: adoption replaces a TERMINAL match. If the agent has not
+  // yet fetched that match's final state, the reset below would silently lose
+  // its end-of-game envelope (results + the server messaging envelope,
+  // #514/#517) — capture it (coordinator-side, consume-once) so the adopted
+  // match's first agent-facing response delivers it verbatim as
+  // previousMatchResult. Delivered/absent outcomes are no-ops inside.
+  captureUndeliveredOutcome(DRIVER.matchId);
+  DRIVER.matchId = matchId;
+  DRIVER.matchGameId = gameId ?? null;
+  DRIVER.lastParkedSeq = -1;
+  DRIVER.parkedVia = { ws: 0, http: 0 };
+  DRIVER.phase = 'queued';
+}
+
 // Build the WS receiver adapter with the supervisor's event handlers bound in.
 // makeWebSocket is injectable for tests.
 export function makeWsReceiver({ api, server, logger, makeWebSocket }) {
   function handleMatchFound(frame) {
     try {
       if (DRIVER.paused) return; //  leave_queue: ignore NEW pairings
-      if (DRIVER.matchId) return; //  single-match v1 — ignore extras
       if (!frame?.matchId) return;
-      DRIVER.matchId = frame.matchId;
-      DRIVER.matchGameId = frame.gameId ?? DRIVER.gameId;
+      if (frame.matchId === DRIVER.matchId) return; //  duplicate push for the tracked match
+      // Single-match v1: only a LIVE match occupies the slot. A terminal one
+      // does not (#663): a tournament Bo-N series delivers game 2 (and the
+      // next round's game) as a fresh match_found with no re-queue — accept it
+      // and reset the per-match state, exactly as a fresh queue_match would.
+      if (DRIVER.matchId && DRIVER.phase !== 'terminal') return; //  live match — ignore extras
+      adoptMatch(frame.matchId, frame.gameId ?? DRIVER.gameId);
       const owner = getOwnerCoordinator();
       if (owner && DRIVER.boundSessionKey) {
         owner.attachMatch(DRIVER.boundSessionKey, DRIVER.matchId, DRIVER.matchGameId);
@@ -277,11 +311,14 @@ export function makeWsReceiver({ api, server, logger, makeWebSocket }) {
       // The WS game_over frame carries the full outcome (results/reason/replayUrl)
       // plus the server messaging envelope (#514) — capture all of it so get_turn
       // surfaces results/reason/replayUrl (#510) and forwards messaging verbatim (#517).
+      // `nextGameAssigned` (#663) is the structured don't-re-queue signal the
+      // game_over guidance keys on; absent on non-tournament frames and pre-#663 servers.
       finishMatch(owner, { closeGame }, { api, logger }, 'ws', {
         results: frame?.results,
         replayUrl: frame?.replayUrl,
         reason: frame?.reason,
         messaging: frame?.messaging,
+        nextGameAssigned: frame?.nextGameAssigned,
       });
     } catch (err) {
       logger.warn?.(`[steamedclaw-plugin] game_over handler error: ${err?.message ?? err}`);
@@ -318,14 +355,43 @@ export function makeWsReceiver({ api, server, logger, makeWebSocket }) {
 // queued→matched transition over the HTTP fallback when WS is down, parks
 // HTTP-fallback turns, re-wakes an unconsumed turn, and finalizes on game_over.
 // The supervisor runs for the plugin lifetime: after a game it IDLES on the
-// terminal phase until the agent re-queues — it does not stop, so a second
-// sequential game ("play again") is serviced. `receiver`/`api` optional ⇒ pure
+// terminal phase — it does not stop — until the agent re-queues OR the
+// post-terminal safety-cadence discovery (#663) adopts the next server-created
+// match (tournament series game / next round), so both "play again" and an
+// unattended tournament series are serviced. `receiver`/`api` optional ⇒ pure
 // HTTP pull floor (the tested path).
 export async function supervisorTick({ client, server, cfg, logger, receiver, api }) {
   try {
-    if (DRIVER.phase === 'terminal') return 'idle'; //  game over — wait for a re-queue
     DRIVER.tickCount += 1;
     const safety = DRIVER.tickCount % SAFETY_NET_EVERY_TICKS === 0;
+    if (DRIVER.phase === 'terminal') {
+      // Game over — idle, but do NOT go blind (#663): a tournament Bo-N series
+      // (or the next round) creates this agent's next match server-side with
+      // no re-queue, and its match_found push can even race the game_over
+      // frame (observed live: game 2's push landed 1ms before game 1's
+      // game_over) — in that order handleMatchFound's terminal-aware guard
+      // never sees it, and /ws/agent replays only frames that were never
+      // delivered. On the safety cadence, discover an unfinished match over
+      // HTTP and adopt it; the attach block below opens it this same tick.
+      if (!safety || DRIVER.paused || !DRIVER.boundSessionKey) return 'idle';
+      if (DRIVER.backoffUntil && Date.now() < DRIVER.backoffUntil) return 'idle';
+      if (typeof client.activeMatch !== 'function') return 'idle';
+      const terminalCreds = readCredentials();
+      if (!terminalCreds?.apiKey) return 'idle';
+      client.setApiKey(terminalCreds.apiKey);
+      // No gameId filter: the next tournament game is not tied to whatever the
+      // agent last QUEUED (it may never have queued this game at all).
+      const am = await client.activeMatch(terminalCreds.agentId);
+      if (rateLimited(am, logger)) return 'idle';
+      // Re-check after the await: a WS match_found may have adopted first.
+      if (DRIVER.phase !== 'terminal') return 'continue';
+      if (!am.ok || !am.matchId || am.matchId === DRIVER.matchId) return 'idle';
+      adoptMatch(am.matchId, am.gameId ?? null);
+      logger.info?.(
+        `[steamedclaw-plugin] post-terminal discovery adopted matchId=${DRIVER.matchId}`,
+      );
+      //  fall through — the attach block below binds + opens the game socket now
+    }
 
     const owner = getOwnerCoordinator();
     if (!owner) return 'continue'; //  no full-mode owner yet
@@ -423,17 +489,28 @@ export async function supervisorTick({ client, server, cfg, logger, receiver, ap
     // poll match state, PARK each new your_turn, finalize on game_over.
     const gameWsReady = Boolean(receiver && receiver.status().gameReady);
     if (gameWsReady && !safety) return 'continue';
-    const st = await client.getState(DRIVER.matchId);
+    const polledMatchId = DRIVER.matchId;
+    const st = await client.getState(polledMatchId);
     if (rateLimited(st, logger)) return 'continue';
     if (!st.ok) return 'continue';
+    // Discard a stale response (#663): adoption can swap the tracked match
+    // WHILE this poll is in flight (game_over + the next series game's
+    // match_found land between request and response — observed 1ms apart
+    // live). finishMatch/parkTurn below act on the CURRENT DRIVER.matchId, so
+    // applying the old match's state would mark the NEW match terminal with
+    // the OLD outcome (bricking it — terminalGames never reopens) or park a
+    // phantom high-sequence turn that dedupes the new game's real turns away.
+    if (DRIVER.matchId !== polledMatchId) return 'continue';
     if (typeof st.status === 'string' && TERMINAL_MATCH_STATUSES.has(st.status)) {
       // getState already fetched the terminal outcome — capture results/replayUrl
       // so the opponent-ended get_turn surfaces them (#510), plus the server
-      // messaging envelope (#514) to forward verbatim (#517). reason is WS-only.
+      // messaging envelope (#514) to forward verbatim (#517), plus the #663
+      // nextGameAssigned don't-re-queue signal. reason is WS-only.
       finishMatch(owner, receiver, { api, logger }, 'http', {
         results: st.results,
         replayUrl: st.replayUrl,
         messaging: st.messaging,
+        nextGameAssigned: st.nextGameAssigned,
       });
       return 'idle'; //  game over — the supervisor keeps ticking for a re-queue
     }
@@ -481,9 +558,11 @@ function makeSupervisorService(api, client, server, cfg, logger, receiver) {
       stopped = false;
       if (timer) return; //  already ticking — start() can fire twice per boot
       // The supervisor runs for the plugin lifetime. It is NOT stopped after a
-      // game — supervisorTick idles on the terminal phase and resumes when the
-      // agent re-queues, so play-again works. Only the service lifecycle stop()
-      // (plugin unload) clears the interval.
+      // game — supervisorTick idles on the terminal phase and resumes on a
+      // re-queue or on post-terminal match discovery (#663 — tournament series
+      // games arrive with no re-queue), so play-again and unattended series
+      // play both work. Only the service lifecycle stop() (plugin unload)
+      // clears the interval.
       timer = setInterval(() => {
         if (stopped) return;
         void supervisorTick({ client, server, cfg, logger, receiver, api });
@@ -657,12 +736,45 @@ function makeQueueTool({ client, server, cfg, logger, receiver, coordinator }) {
         return toolText({ ok: false, error: 'not_registered', message: NOT_REGISTERED_MESSAGE });
       // Slot check at cap=1: an active match occupies the only slot.
       if (DRIVER.matchId && DRIVER.phase !== 'terminal') {
-        return toolText({
-          ok: false,
-          error: 'already_in_match',
+        if (DRIVER.phase === 'in_match') {
+          return toolText({
+            ok: false,
+            error: 'already_in_match',
+            matchId: DRIVER.matchId,
+            game: DRIVER.gameId,
+          });
+        }
+        // #663: a match is tracked but NOT attached. Tournament matches bypass
+        // matchmaking, so their match_found can land before any session is
+        // bound (this may be the agent's first queue_match this process) — and
+        // dead-ending that as already_in_match left NO tool-level recovery via
+        // the one tool that binds a session. Bind this call's ctx and adopt
+        // the pending match instead; the supervisor's attach block completes
+        // the join on the next tick.
+        client.setApiKey(creds.apiKey);
+        coordinator.bindSession(ctx?.sessionKey, ctx?.agentId);
+        coordinator.clearSessionMatch(ctx?.sessionKey); //  drop any finished-match binding
+        DRIVER.boundSessionKey = ctx?.sessionKey ?? DRIVER.boundSessionKey;
+        DRIVER.boundAgentId = ctx?.agentId ?? DRIVER.boundAgentId;
+        if (DRIVER.matchGameId) DRIVER.gameId = DRIVER.matchGameId;
+        DRIVER.phase = 'queued'; //  the attach block completes the join
+        DRIVER.paused = false;
+        receiver?.ensureStarted?.();
+        const adopted = {
+          ok: true,
+          status: 'matched',
           matchId: DRIVER.matchId,
-          game: DRIVER.gameId,
-        });
+          game: DRIVER.matchGameId ?? DRIVER.gameId,
+        };
+        // #663 carryover: this 'matched' result is the adopted match's first
+        // agent-facing response on the C path — deliver a displaced terminal
+        // envelope here, verbatim, exactly once.
+        const carried = takeCarryover(DRIVER.matchId);
+        if (carried) {
+          adopted.previousMatchResult = carried;
+          adopted.guidance = carryoverGuidance(carried);
+        }
+        return toolText(adopted);
       }
 
       const resolvedLane = lane ?? cfg.defaultLane ?? DEFAULT_LANE;
@@ -783,17 +895,17 @@ function makeInfoTools({ client }) {
 // ── tournament_status (#426): read-only tournament awareness ─────────────────
 // Entry is deliberately NOT exposed: registration is an owner act on the portal
 // (planning/063 §9.3 re-scope, 2026-08-05). The tool only reads. The entered
-// view is assembled from the public reads (/schedule, /pairings, /standings)
+// view is assembled from the public reads (/schedule, /series, /standings)
 // because /me carries entry fields only; every server shape passes through
 // verbatim. Unregistered agents still get discovery — /active is public.
 
 // Mirrors the server's LIVE_STAGE_ORDER: when rounds of several stages are
 // open, the later stage is the one the agent is playing in.
 const TOURNAMENT_STAGE_ORDER = { qualifying: 0, seeding: 1, bracket: 2, shootout: 3 };
-// Pool stages open ONE round PER POOL concurrently (roundNumber encodes
-// stageIndex*1000+poolIndex), so finding this agent's round means scanning the
-// open rounds' pairing lists. Cap the scan so a huge pool count can't turn one
-// tool call into an unbounded request storm (pilot scale: ≤16 pools).
+// #646: rounds within a pool run sequentially and the schedule aggregates to
+// one row per stage-round, so normally exactly ONE open row exists and the
+// agent has at most ONE series in it. The scan cap stays as a guard so an
+// unexpected schedule shape can't turn one tool call into a request storm.
 const TOURNAMENT_POOL_SCAN_CAP = 16;
 
 function makeTournamentStatusTool({ client, server, sleep }) {
@@ -814,7 +926,7 @@ function makeTournamentStatusTool({ client, server, sleep }) {
 
   return () => ({
     name: 'tournament_status',
-    description: `Check SteamedClaw tournament status — read-only awareness. No parameters; example call: tournament_status(). Returns {ok, state, ...} where state is one of: "none_active" — no tournament running; "not_registered" — a tournament exists (summary included) but you have no SteamedClaw registration (entry requires a registered agent your owner has claimed); "not_entered" — tournament summary + enterUrl: entry happens ONLY on the owner portal, so tell your OWNER to visit enterUrl (you cannot enter); "entered" — your entry plus round (stage, roundNumber, window times), pairings (your matchups this round: opponent id and name, bestOfN, matchIds, outcome — empty in table formats), and standing (your rank row); "withdrawn" — you were entered but withdrew. This tool does NOT enter or withdraw you from tournaments and does not play matches — entry is an owner action on the portal, and tournament matches arrive automatically as normal match_found pushes (play them via get_turn and take_turn as usual). On error:"rate_limited", wait a few seconds and call again.`,
+    description: `Check SteamedClaw tournament status — read-only awareness. No parameters; example call: tournament_status(). Returns {ok, state, ...} where state is one of: "none_active" — no tournament running; "not_registered" — a tournament exists (summary included) but you have no SteamedClaw registration (entry requires a registered agent your owner has claimed); "not_entered" — tournament summary + enterUrl: entry happens ONLY on the owner portal, so tell your OWNER to visit enterUrl (you cannot enter); "entered" — your entry plus round (stage, roundNumber, window times), series (your matchup this round — normally exactly one: seriesId, opponent id and name, bestOfN, matchIds, outcome; empty in table formats; rounds run one at a time, so you play one match at a time), and standing (your rank row); "withdrawn" — you were entered but withdrew. This tool does NOT enter or withdraw you from tournaments and does not play matches — entry is an owner action on the portal, and tournament matches arrive automatically as normal match_found pushes (play them via get_turn and take_turn as usual). On error:"rate_limited", wait a few seconds and call again.`,
     parameters: { type: 'object', properties: {}, additionalProperties: false },
     async execute() {
       // Bounded 429 handling (feedback_http_client_handle_429): ONE floored,
@@ -878,14 +990,15 @@ function makeTournamentStatusTool({ client, server, sleep }) {
         // Entered: best-effort assembly — a failed sub-read nulls its field
         // rather than failing the whole status (429s still surface, above).
         //
-        // Round attribution: single-round stages (seeding/bracket/shootout) have
-        // one open round — it IS the agent's round. Pool stages open one round
-        // PER POOL at once, so the agent's round is the one whose pairing list
-        // contains it — scan the open rounds of the latest open stage (capped)
-        // and keep EVERY pairing of the agent's in that round (round-robin pools
-        // pair an agent against each pool-mate in the same round).
+        // Round attribution (#646): rounds run sequentially and the schedule
+        // aggregates to one row per stage-round, so the latest open stage
+        // normally has exactly ONE open row — it IS the agent's round. The
+        // /series read returns the union across the stage-round's pools;
+        // filtering by our own agent id finds the agent's series (at most one
+        // per round; none in a bye round of an odd pool). The capped loop
+        // stays as a guard against an unexpected multi-open-row shape.
         let round = null;
-        let myPairingRows = null;
+        let mySeriesRows = null;
         const sched = await readWithRetry(() => client.tournamentSchedule(t.id));
         if (!sched.ok && sched.httpStatus === 429) return toolText(readFailure(sched));
         if (sched.ok) {
@@ -901,22 +1014,23 @@ function makeTournamentStatusTool({ client, server, sleep }) {
               .sort((a, b) => a.roundNumber - b.roundNumber)
               .slice(0, TOURNAMENT_POOL_SCAN_CAP);
             if (candidates.length === 1) {
-              // Exactly one open round: the agent's round even when its pairing
-              // list is empty (table formats put seats in tables, not pairings).
+              // Exactly one open round: the agent's round even when its series
+              // list is empty (table formats put seats in tables, not series;
+              // an odd pool's bye round leaves the agent without a series).
               round = candidates[0];
             }
             for (const r of candidates) {
               const pr = await readWithRetry(() =>
-                client.tournamentPairings(t.id, r.roundNumber, r.stage),
+                client.tournamentSeries(t.id, r.roundNumber, r.stage, r.poolStage),
               );
               if (!pr.ok && pr.httpStatus === 429) return toolText(readFailure(pr));
               if (!pr.ok) break; //  best-effort: stop the scan on a hard failure
-              const mine = pr.pairings.filter(
+              const mine = pr.series.filter(
                 (p) => p?.agentAId === creds.agentId || p?.agentBId === creds.agentId,
               );
               if (mine.length > 0) {
                 round = r;
-                myPairingRows = mine;
+                mySeriesRows = mine;
                 break;
               }
             }
@@ -928,12 +1042,12 @@ function makeTournamentStatusTool({ client, server, sleep }) {
         const rows = stand.ok ? stand.standings : [];
         const standing = rows.find((row) => row?.agentId === creds.agentId) ?? null;
 
-        const pairings = (myPairingRows ?? []).map((p) => {
+        const series = (mySeriesRows ?? []).map((p) => {
           const opponentAgentId = p.agentAId === creds.agentId ? p.agentBId : p.agentAId;
           return {
-            pairingId: p.pairingId,
+            seriesId: p.seriesId,
             opponentAgentId,
-            // Display name resolved from the standings rows (the pairing
+            // Display name resolved from the standings rows (the series
             // payload carries ids only); null when the opponent has no row.
             opponentName: rows.find((row) => row?.agentId === opponentAgentId)?.agentName ?? null,
             bestOfN: p.bestOfN,
@@ -948,7 +1062,7 @@ function makeTournamentStatusTool({ client, server, sleep }) {
           tournament: t,
           entry: me.entry,
           round,
-          pairings,
+          series,
           standing,
         });
       } catch (err) {
