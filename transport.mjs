@@ -26,7 +26,7 @@
 import https from 'node:https';
 import http from 'node:http';
 
-export const PLUGIN_USER_AGENT = 'steamedclaw-plugin/1.0.5';
+export const PLUGIN_USER_AGENT = 'steamedclaw-plugin/1.0.6';
 export const TERMINAL_MATCH_STATUSES = new Set(['game_over']);
 
 export function httpRequest(method, urlStr, apiKey, body, userAgent = PLUGIN_USER_AGENT) {
@@ -192,38 +192,21 @@ export function makeClient({
           retryAfterMs: res.data?.retryAfterMs,
         };
       }
-      const s = res.data ?? {};
-      // replayUrl is present on the server's game-over state response
-      // (buildGameOverResponse) — thread it so the opponent-ended get_turn path
-      // can surface it (#510). The state endpoint carries no `reason` (status is
-      // always 'game_over'); that field stays WS-only, matching 0.9.x.
-      // `messaging` (the server-authored end-of-game envelope, #514) is top-level
-      // on the game-over /state response — forward it verbatim (#517). It is
-      // undefined on non-terminal states (no envelope), which cleanOutcome drops.
-      return {
-        ok: true,
-        status: s.status,
-        sequence: s.sequence,
-        view: s.view,
-        //  `messages` rides the discussion-phase state response (status
-        //  'discussion') — the table talk so far; threaded for the #538
-        //  receive-buffer backfill. Undefined elsewhere.
-        messages: s.messages,
-        // `awaitingAction` rides the discussion-phase state response (#541) —
-        // true iff this agent still owes its phase action. Threaded verbatim
-        // for the #552 fallback parking gate; undefined on non-discussion
-        // states and on pre-#541 servers (which must stay backfill-only).
-        awaitingAction: s.awaitingAction,
-        results: s.results,
-        replayUrl: s.replayUrl,
-        messaging: s.messaging,
-        // `nextGameAssigned` rides the game-over state response (#663): true
-        // while this agent's tournament run continues (the server assigns the
-        // next game — the agent must NOT re-queue). Threaded verbatim so the
-        // coordinator's game_over guidance can key on it; undefined on
-        // non-terminal states, non-tournament matches, and pre-#663 servers.
-        nextGameAssigned: s.nextGameAssigned,
-      };
+      const s =
+        res.data && typeof res.data === 'object' && !Array.isArray(res.data) ? res.data : {};
+      // FULL PASSTHROUGH (#724): the /state body is returned whole; the plugin
+      // adds only its transport `ok` flag. The supervisor reads the non-terminal
+      // fields it needs off it (status, sequence, view; the discussion-phase
+      // `messages` table talk for the #538 backfill and `awaitingAction` for the
+      // #541/#552 parking gate — both undefined outside discussion states and on
+      // older servers, which must stay backfill-only). On a terminal read the
+      // body IS the server's end-of-game envelope (buildGameOverResponse:
+      // results, rating, newBadges, shareText, suggestions, the final view,
+      // replayUrl/replayMarkdownUrl, messaging #514/#517, nextGameAssigned
+      // #663, and any field added later) and rides through to the agent
+      // untouched — no allowlist here to widen. The state endpoint carries no
+      // `reason` (status is always 'game_over'); that field stays WS-only.
+      return { ...s, ok: true };
     },
 
     // Submit an action; map into the coordinator's transport ack shape so WS and
@@ -242,18 +225,14 @@ export function makeClient({
       if (res.status === 200 && res.data?.success === true && res.data.state) {
         const st = res.data.state;
         if (typeof st.status === 'string' && TERMINAL_MATCH_STATUSES.has(st.status)) {
-          // The terminal /action response wraps buildGameOverResponse in `state`,
-          // so the server messaging envelope (#514) rides on st.messaging — forward
-          // it verbatim so a self-ending move surfaces encouragement too (#517).
-          // `nextGameAssigned` (#663) rides the same terminal state: threaded so
-          // the take_turn game_over ack carries the don't-re-queue signal too.
-          return {
-            status: 'game_over',
-            results: st.results,
-            replayUrl: st.replayUrl,
-            messaging: st.messaging,
-            nextGameAssigned: st.nextGameAssigned,
-          };
+          // The terminal /action response wraps buildGameOverResponse in `state`
+          // — the same end-of-game envelope the /state read carries (results,
+          // rating, newBadges, shareText, suggestions, view, replay URLs,
+          // messaging #514/#517, nextGameAssigned #663, ...). FULL PASSTHROUGH
+          // (#724): the whole state rides on the take_turn game_over ack, so a
+          // self-ending move surfaces everything the server said; only the
+          // protocol status is normalized.
+          return { ...st, status: 'game_over' };
         }
         return { status: st.status, sequence: st.sequence, view: st.view };
       }

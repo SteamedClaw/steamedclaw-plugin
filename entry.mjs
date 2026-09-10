@@ -308,18 +308,13 @@ export function makeWsReceiver({ api, server, logger, makeWebSocket }) {
     try {
       const owner = getOwnerCoordinator();
       if (!owner || !DRIVER.matchId || DRIVER.phase === 'terminal') return;
-      // The WS game_over frame carries the full outcome (results/reason/replayUrl)
-      // plus the server messaging envelope (#514) — capture all of it so get_turn
-      // surfaces results/reason/replayUrl (#510) and forwards messaging verbatim (#517).
-      // `nextGameAssigned` (#663) is the structured don't-re-queue signal the
-      // game_over guidance keys on; absent on non-tournament frames and pre-#663 servers.
-      finishMatch(owner, { closeGame }, { api, logger }, 'ws', {
-        results: frame?.results,
-        replayUrl: frame?.replayUrl,
-        reason: frame?.reason,
-        messaging: frame?.messaging,
-        nextGameAssigned: frame?.nextGameAssigned,
-      });
+      // The WS game_over frame IS the server's end-of-game envelope (results,
+      // reason, rating, newBadges, shareText, replay URLs, messaging #514/#517,
+      // nextGameAssigned #663, ...). FULL PASSTHROUGH (#724): hand the whole
+      // frame to the coordinator — cleanOutcome strips only the plugin-owned
+      // keys (type/status/ok/via) — so get_turn surfaces everything the server
+      // said, verbatim.
+      finishMatch(owner, { closeGame }, { api, logger }, 'ws', frame);
     } catch (err) {
       logger.warn?.(`[steamedclaw-plugin] game_over handler error: ${err?.message ?? err}`);
     }
@@ -502,16 +497,12 @@ export async function supervisorTick({ client, server, cfg, logger, receiver, ap
     // phantom high-sequence turn that dedupes the new game's real turns away.
     if (DRIVER.matchId !== polledMatchId) return 'continue';
     if (typeof st.status === 'string' && TERMINAL_MATCH_STATUSES.has(st.status)) {
-      // getState already fetched the terminal outcome — capture results/replayUrl
-      // so the opponent-ended get_turn surfaces them (#510), plus the server
-      // messaging envelope (#514) to forward verbatim (#517), plus the #663
-      // nextGameAssigned don't-re-queue signal. reason is WS-only.
-      finishMatch(owner, receiver, { api, logger }, 'http', {
-        results: st.results,
-        replayUrl: st.replayUrl,
-        messaging: st.messaging,
-        nextGameAssigned: st.nextGameAssigned,
-      });
+      // getState already fetched the terminal /state body — the server's whole
+      // end-of-game envelope. FULL PASSTHROUGH (#724): hand it to the
+      // coordinator as-is (cleanOutcome strips only the plugin-owned keys,
+      // type/status/ok/via) so the opponent-ended get_turn surfaces everything
+      // the server said (#510/#517/#663 and whatever comes next). reason is WS-only.
+      finishMatch(owner, receiver, { api, logger }, 'http', st);
       return 'idle'; //  game over — the supervisor keeps ticking for a re-queue
     }
     if (st.status === 'discussion') {

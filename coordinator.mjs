@@ -114,26 +114,37 @@ export function __resetState() {
   SHARED.tokenSeq = 0;
 }
 
-// Build a clean terminal-outcome object from a source that carries some of
-// { results, replayUrl, reason, messaging, nextGameAssigned } — dropping
-// undefined keys so a bare
-// game_over (nothing captured) never surfaces phantom `results:undefined` etc. (#510).
-// `reason` is best-effort: WS game_over frames carry it; the HTTP state endpoint
-// does not (it always reports status:'game_over'), matching 0.9.x's HTTP path.
-// `messaging` is the server-authored end-of-game envelope ({teaser?, encouragement},
-// #514) — forwarded as ONE object so a future reserved field (analysis) lands for
-// free; the plugin never authors, replaces, or cherry-picks its text (#517).
-// `nextGameAssigned` (#663) is the server's structured don't-re-queue signal
-// (true only while the agent's tournament run continues); captured so the
-// game_over guidance below can key on STRUCTURE, never on parsing server text.
+// Build the terminal-outcome object the agent sees from whatever the server
+// sent at game over — the WS game_over frame, the terminal /state body, or the
+// terminal /action state. FULL PASSTHROUGH (#724): every key on the server's
+// envelope is forwarded verbatim — results, reason, rating, newBadges,
+// shareText, suggestions, the final view, replayUrl/replayMarkdownUrl,
+// messaging (#514/#517), nextGameAssigned (#663), and anything the server adds
+// later. There is deliberately NO allowlist to widen: the plugin removes
+// transport boilerplate from the LLM, it does not adjudicate what the agent
+// gets to know — policy (seat-filtered views, unrated lanes withholding
+// rating) lives on the server. Before 1.0.6 a fixed list here dropped rating,
+// badges, share text, suggestions and the final board, so a plugin agent
+// learned less than an agent on the raw API.
+//
+// Undefined values are dropped so a bare game_over (nothing captured) never
+// surfaces phantom `results:undefined` keys (#510); null is a server value
+// (rating:null on an unrated lane, newBadges:null on a cold read) and is kept.
+// The only keys NOT forwarded are the ones the plugin itself owns:
+//   type   — the WS frame wrapper ({type:'game_over'})
+//   status — the protocol status the coordinator sets ('game_over')
+//   ok     — the transport's own success flag on an HTTP read
+//   via    — the submit path's transport tag
+// `reason` is best-effort: WS game_over frames carry it; the HTTP state
+// endpoint does not (it always reports status:'game_over').
+const OUTCOME_PROTOCOL_KEYS = new Set(['type', 'status', 'ok', 'via']);
 function cleanOutcome(source) {
-  if (!source || typeof source !== 'object') return null;
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return null;
   const out = {};
-  if (source.results !== undefined) out.results = source.results;
-  if (source.replayUrl !== undefined) out.replayUrl = source.replayUrl;
-  if (source.reason !== undefined) out.reason = source.reason;
-  if (source.messaging !== undefined) out.messaging = source.messaging;
-  if (source.nextGameAssigned !== undefined) out.nextGameAssigned = source.nextGameAssigned;
+  for (const [k, v] of Object.entries(source)) {
+    if (OUTCOME_PROTOCOL_KEYS.has(k) || v === undefined) continue;
+    out[k] = v;
+  }
   return Object.keys(out).length > 0 ? out : null;
 }
 
@@ -183,7 +194,7 @@ export function takeCarryover(currentMatchId) {
   if (!c || !currentMatchId || c.matchId === currentMatchId) return null;
   SHARED.carryover = null;
   SHARED.deliveredOutcomes.add(c.matchId);
-  return { matchId: c.matchId, ...c.outcome }; //  the stored envelope, verbatim
+  return { ...c.outcome, matchId: c.matchId }; //  the stored envelope, verbatim; matchId ours
 }
 
 // Structural framing for a delivered carryover block (no server text is
@@ -461,10 +472,13 @@ function makeCoordinator(api) {
       if (SHARED.terminalMatches.has(matchId)) {
         // Surface the outcome captured at terminal detection so an agent parked
         // in get_turn on the opponent-ended path learns win/loss + replay, not a
-        // bare terminal status (#510). Absent ⇒ bare game_over (no phantom keys).
+        // bare terminal status (#510) — the WHOLE server envelope (#724), with
+        // the plugin's protocol keys (status/matchId) set LAST so the server's
+        // copy can never override the match this binding is actually about.
+        // Absent ⇒ bare game_over (no phantom keys).
         const outcome = SHARED.terminalOutcomes.get(matchId);
         return outcome
-          ? { status: 'game_over', matchId, ...outcome }
+          ? { ...outcome, status: 'game_over', matchId }
           : { status: 'game_over', matchId };
       }
       // Discussion table talk rides every non-terminal read (#538) so the agent
@@ -534,18 +548,15 @@ function makeCoordinator(api) {
           action,
           httpSubmit,
         });
-        if (ack && ack.ok === false) {
-          // Server REJECTED the action (structured error from transport, #511) —
-          // map it to an actionable take_turn error (with a get_rules hint on
-          // invalid_action) instead of collapsing everything to submit_failed.
-          return mapServerRejection(ack, rec);
-        }
-        if (ack.status === 'game_over') {
+        // A terminal ack is checked BEFORE the rejection check: the envelope
+        // passes through unfiltered (#724), so a future server key named `ok`
+        // must not be mistaken for the transport's own rejection flag.
+        if (ack && ack.status === 'game_over') {
           SHARED.terminalMatches.add(rec.matchId);
           SHARED.currentTokenByMatch.delete(rec.matchId);
           SHARED.messagesByMatch.delete(rec.matchId);
           // Persist the outcome so a get_turn re-read after a self-ending move
-          // also carries results/replayUrl, not just the transient take_turn ack (#510).
+          // also carries the envelope, not just the transient take_turn ack (#510).
           const outcome = cleanOutcome(ack);
           if (outcome) {
             SHARED.terminalOutcomes.set(rec.matchId, outcome);
@@ -553,7 +564,15 @@ function makeCoordinator(api) {
             // this IS agent-facing delivery, so adoption must not re-carry it.
             SHARED.deliveredOutcomes.add(rec.matchId);
           }
-          return { ok: true, ...ack };
+          // Same shape as the get_turn game_over read: the cleaned envelope with
+          // the plugin's protocol keys (ok/status/matchId) set last so they win.
+          return { ...(outcome ?? {}), ok: true, status: 'game_over', matchId: rec.matchId };
+        }
+        if (ack && ack.ok === false) {
+          // Server REJECTED the action (structured error from transport, #511) —
+          // map it to an actionable take_turn error (with a get_rules hint on
+          // invalid_action) instead of collapsing everything to submit_failed.
+          return mapServerRejection(ack, rec);
         }
         if (action?.type === 'message') {
           // Message actions are non-turn-consuming SERVER-side (the action route
@@ -674,7 +693,7 @@ export function makeGetTurnFactory(coordinator, { nextTurnBlockMs } = {}) {
   const blockSecs = Math.round(blockMs / 1000);
   return (ctx) => ({
     name: 'get_turn',
-    description: `Fetch your current SteamedClaw turn. This call WAITS up to ~${blockSecs}s for your turn to arrive, then returns status: "not_joined" (you have not queued — call queue_match first), "no_match" (still matchmaking — call again), "waiting" (matched, opponent's turn — call again), "your_turn" (act now: pass the returned turnToken to take_turn), or "game_over" (the match ended — stop). In discussion games (werewolf, murder-mystery) the result may also carry a "messages" array — the recent table talk; read it before acting (absent when nothing has been said). Just call it again whenever it returns no_match or waiting. ${PLAY_LOOP}`,
+    description: `Fetch your current SteamedClaw turn. This call WAITS up to ~${blockSecs}s for your turn to arrive, then returns status: "not_joined" (you have not queued — call queue_match first), "no_match" (still matchmaking — call again), "waiting" (matched, opponent's turn — call again), "your_turn" (act now: pass the returned turnToken to take_turn), or "game_over" (the match ended — the result carries the server's end-of-game envelope verbatim, typically results, rating, newBadges, shareText, replayUrl and messaging plus whatever else the server sends; fields vary by transport; stop). In discussion games (werewolf, murder-mystery) the result may also carry a "messages" array — the recent table talk; read it before acting (absent when nothing has been said). Just call it again whenever it returns no_match or waiting. ${PLAY_LOOP}`,
     parameters: { type: 'object', properties: {}, additionalProperties: false },
     async execute() {
       const sessionKey = ctx?.sessionKey;
@@ -739,7 +758,7 @@ export function makeGetTurnFactory(coordinator, { nextTurnBlockMs } = {}) {
 export function makeTakeTurnFactory(coordinator, { httpSubmit }) {
   return (ctx) => ({
     name: 'take_turn',
-    description: `Submit your one action for the current SteamedClaw turn. Pass the turnToken that get_turn returned with status "your_turn", plus your chosen action (the move shape is game-specific, e.g. {type:"move", position:4} for tic-tac-toe). On success returns {ok:true, status:"submitted"} (call get_turn again) or {ok:true, status:"game_over", results, replayUrl, messaging?, nextGameAssigned?} (the match ended — if a messaging object is present, surface messaging.encouragement to your operator verbatim; if the result carries nextGameAssigned:true your tournament run continues and the server assigns your next game automatically — do NOT call queue_match, call get_turn instead; otherwise call queue_match to play again or stop). In discussion phases you may also pass {type:"message", text:"..."} — a table statement that does NOT consume your turn: it returns {ok:true, status:"message_sent"} and the SAME turnToken stays valid for your phase action. On error the result is {ok:false, error, ...} — recover by error code: "invalid_action" means the action shape was rejected — the result includes a "hint" pointing at get_rules for the current game; fetch the rules and retry with a conformant action. "stale_sequence" means a newer turn arrived (a "currentSequence" is included) — call get_turn to refresh, then retry. "not_your_turn" means the server advanced without a turn this agent saw — call get_turn to refresh. "game_already_over" means the match has ended — call get_turn to confirm, then follow that result's guidance. "submit_failed" is a transient transport failure — wait a moment and retry. After submitting, call get_turn again. ${PLAY_LOOP}`,
+    description: `Submit your one action for the current SteamedClaw turn. Pass the turnToken that get_turn returned with status "your_turn", plus your chosen action (the move shape is game-specific, e.g. {type:"move", position:4} for tic-tac-toe). On success returns {ok:true, status:"submitted"} (call get_turn again) or {ok:true, status:"game_over", ...} carrying the server's end-of-game envelope verbatim (typically results, rating, newBadges, shareText, replayUrl, messaging?, nextGameAssigned?, plus whatever else the server sends) (the match ended — if a messaging object is present, surface messaging.encouragement to your operator verbatim; if the result carries nextGameAssigned:true your tournament run continues and the server assigns your next game automatically — do NOT call queue_match, call get_turn instead; otherwise call queue_match to play again or stop). In discussion phases you may also pass {type:"message", text:"..."} — a table statement that does NOT consume your turn: it returns {ok:true, status:"message_sent"} and the SAME turnToken stays valid for your phase action. On error the result is {ok:false, error, ...} — recover by error code: "invalid_action" means the action shape was rejected — the result includes a "hint" pointing at get_rules for the current game; fetch the rules and retry with a conformant action. "stale_sequence" means a newer turn arrived (a "currentSequence" is included) — call get_turn to refresh, then retry. "not_your_turn" means the server advanced without a turn this agent saw — call get_turn to refresh. "game_already_over" means the match has ended — call get_turn to confirm, then follow that result's guidance. "submit_failed" is a transient transport failure — wait a moment and retry. After submitting, call get_turn again. ${PLAY_LOOP}`,
     parameters: {
       type: 'object',
       properties: {
@@ -760,7 +779,7 @@ export function makeTakeTurnFactory(coordinator, { httpSubmit }) {
       // #663 guidance hierarchy: a self-ending move's game_over ack can carry
       // the server's structured "run continues" signal — mirror the get_turn
       // routing so no surface tells a live tournament entrant to re-queue.
-      // Absent the signal, the ack is byte-identical to before.
+      // Absent the signal, no guidance key is added to the ack.
       if (r?.status === 'game_over' && r.nextGameAssigned === true) {
         r.guidance =
           'Your tournament run continues: the server assigns your next game automatically and this plugin picks it up — do NOT call queue_match. If a messaging object is present, surface messaging.encouragement to your operator verbatim, then call get_turn again.';
