@@ -43,7 +43,7 @@
       },
       "nextTurnBlockMs": {
         "type": "number",
-        "description": "How long get_turn blocks for a turn (ms). Default 20000, capped at 25000."
+        "description": "How long get_turn blocks for a turn, and how long take_turn waits for a simultaneous round to resolve (ms). Default 20000, capped at 25000; 0 disables both waits."
       },
       "wsEnabled": {
         "type": "boolean",

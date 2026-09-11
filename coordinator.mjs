@@ -53,17 +53,24 @@ const SHARED = {
   turnWaiters: new Map(), //  sessionKey -> Set<resolve> — blocked get_turn calls (072j)
 };
 
-// Resolve (and clear) all blocked get_turn waiters for a session. Returns how
-// many were woken — the driver skips the heartbeat wake when a waiter consumed
-// the turn (the agent is mid-tool-call, already awake).
-function notifyTurnWaiters(sessionKey) {
+// Resolve (and clear) all blocked waiters for a session. Returns how many
+// CONSUMED the event — the driver skips the heartbeat wake when a waiter
+// consumed it (the agent is mid-tool-call and the tool result carries it).
+// Two kinds of waiter park here (#714):
+//   'get_turn'  — consumes both events: a parked turn rides its result, and so
+//                 does a terminal envelope.
+//   'take_turn' — the simultaneous-round wait. It consumes a 'terminal' event
+//                 (the envelope rides the take_turn ack) but NOT a 'turn' event:
+//                 it returns `submitted` without the turn, so the turn wake
+//                 must still fire exactly as it did before the wait existed.
+function notifyTurnWaiters(sessionKey, event = 'turn') {
   const set = SHARED.turnWaiters.get(sessionKey);
   if (!set || set.size === 0) return 0;
   SHARED.turnWaiters.delete(sessionKey);
   let woken = 0;
-  for (const resolve of set) {
-    resolve();
-    woken += 1;
+  for (const waiter of set) {
+    waiter.resolve();
+    if (waiter.kind === 'get_turn' || event === 'terminal') woken += 1;
   }
   return woken;
 }
@@ -72,17 +79,60 @@ function notifyAllTurnWaiters() {
   for (const sessionKey of [...SHARED.turnWaiters.keys()]) notifyTurnWaiters(sessionKey);
 }
 
+// #714: the terminal ack shape shared by a self-ending move and a simultaneous
+// round that resolved while take_turn waited — the stored envelope (verbatim,
+// #724) with the plugin's protocol keys last. Returning it from a tool result
+// IS agent-facing delivery, so the match is marked delivered here (the #663
+// carryover must not replay it, and finishMatch's skipped heartbeat wake is
+// correct only because the envelope rode this reply).
+function terminalAck(matchId) {
+  const outcome = SHARED.terminalOutcomes.get(matchId);
+  markOutcomeDelivered(matchId); //  also drops a #663 carryover copy captured mid-flight
+  return { ...(outcome ?? {}), ok: true, status: 'game_over', matchId };
+}
+
+// #714: in a simultaneous phase the round resolves only after the LAST seat
+// acts, so the submitting call's own server reply can never carry the
+// end-of-game envelope — it lands later as a pushed game_over frame (or the
+// supervisor's terminal /state read), both of which run markTerminal and fire
+// the session's turn notify. Before 1.0.7 take_turn answered `submitted` at
+// once and the envelope sat in the plugin until the model asked again; a model
+// that believed it had made its last move did not ask. So take_turn now parks
+// on the same notify get_turn blocks on, for whatever is left of the SAME
+// nextTurnBlockMs budget measured from the tool call's start (the HTTP submit
+// itself may have spent most of it; the host's tool-call ceiling is the reason
+// for the cap, and it applies to the whole call, not to the wait). Returns the
+// terminal ack when the match ended, null otherwise (a new round's turn also
+// ends the wait — it is parked for get_turn; take_turn never surfaces tokens).
+async function awaitSimultaneousResolution(sessionKey, matchId, startedAt, blockMs) {
+  const budget = Math.max(0, Math.min(blockMs ?? 0, MAX_NEXT_TURN_BLOCK_MS));
+  if (!SHARED.terminalMatches.has(matchId)) {
+    const remaining = budget - (Date.now() - startedAt);
+    if (remaining <= 0) return null;
+    await waitForTurnNotify(sessionKey, remaining, 'take_turn');
+  }
+  if (!SHARED.terminalMatches.has(matchId)) return null;
+  return terminalAck(matchId);
+}
+
+const SIMULTANEOUS_SUBMITTED_MESSAGE =
+  'Your action is in. This round resolves only when all players have acted. Call get_turn now — if that was the last round, the match result may be waiting there.';
+
 // Park the caller until notifyTurnWaiters(sessionKey) fires or ms elapses.
-function waitForTurnNotify(sessionKey, ms) {
+// `kind` tags the waiter for the consumed-event count (see notifyTurnWaiters).
+function waitForTurnNotify(sessionKey, ms, kind = 'get_turn') {
   return new Promise((resolve) => {
     let set = SHARED.turnWaiters.get(sessionKey);
     if (!set) {
       set = new Set();
       SHARED.turnWaiters.set(sessionKey, set);
     }
-    const entry = () => {
-      clearTimeout(timer);
-      resolve();
+    const entry = {
+      kind,
+      resolve: () => {
+        clearTimeout(timer);
+        resolve();
+      },
     };
     const timer = setTimeout(() => {
       set.delete(entry);
@@ -456,7 +506,9 @@ function makeCoordinator(api) {
 
       // Wake any get_turn call blocked on this session (072j). woken > 0 means
       // the agent is mid-tool-call — the driver then skips the heartbeat wake.
-      const woken = notifyTurnWaiters(sessionKey);
+      // A parked take_turn (#714) is resolved too but does NOT count: it
+      // returns without the turn, so the wake must still fire.
+      const woken = notifyTurnWaiters(sessionKey, 'turn');
       return { turnToken, packet, woken };
     },
 
@@ -522,7 +574,8 @@ function makeCoordinator(api) {
     // ack shape over WS or HTTP. Rejects stale/replayed/wrong-session/wrong-match
     // tokens. Not owner-gated — runs in whatever instance the host invokes the
     // tool in, reading the shared token store.
-    async submitAction(sessionKey, turnToken, action, httpSubmit) {
+    async submitAction(sessionKey, turnToken, action, httpSubmit, { blockMs = 0 } = {}) {
+      const startedAt = Date.now(); //  #714: the wait budget runs from the call's start
       if (!turnToken) return { ok: false, error: 'missing_token' };
       const rec = SHARED.tokens.get(turnToken);
       if (!rec) return { ok: false, error: 'unknown_token' };
@@ -561,8 +614,9 @@ function makeCoordinator(api) {
           if (outcome) {
             SHARED.terminalOutcomes.set(rec.matchId, outcome);
             // #663: the ack returned below carries the envelope to the agent —
-            // this IS agent-facing delivery, so adoption must not re-carry it.
-            SHARED.deliveredOutcomes.add(rec.matchId);
+            // this IS agent-facing delivery, so adoption must not re-carry it
+            // (and a copy captured while the POST was in flight is dropped).
+            markOutcomeDelivered(rec.matchId);
           }
           // Same shape as the get_turn game_over read: the cleaned envelope with
           // the plugin's protocol keys (ok/status/matchId) set last so they win.
@@ -599,6 +653,26 @@ function makeCoordinator(api) {
         // get_turn, which blocks until the next turn is parked WITH a fresh token.
         // This removes the broken shortcut without adding a second token-minting
         // site or any extra calls (the play loop already round-trips get_turn).
+        //
+        // #714: a simultaneous round cannot resolve inside this reply, so wait
+        // (bounded) for the pushed game_over and return it here if the match
+        // ended — otherwise the model has to know to ask again, and the one
+        // that didn't never saw its result. Sequential acks never wait.
+        if (ack?.gameType === 'simultaneous') {
+          const settled = await awaitSimultaneousResolution(
+            sessionKey,
+            rec.matchId,
+            startedAt,
+            blockMs,
+          );
+          if (settled) return settled;
+          return {
+            ok: true,
+            status: 'submitted',
+            next: 'call get_turn',
+            message: SIMULTANEOUS_SUBMITTED_MESSAGE,
+          };
+        }
         return { ok: true, status: 'submitted', next: 'call get_turn' };
       } catch (err) {
         // Failed submit: release the token so a re-issued packet can retry.
@@ -620,9 +694,10 @@ function makeCoordinator(api) {
       const tok = SHARED.currentTokenByMatch.get(matchId);
       if (tok) SHARED.tokens.delete(tok);
       SHARED.currentTokenByMatch.delete(matchId);
-      // Wake a blocked get_turn so the agent learns game_over immediately.
+      // Wake a blocked get_turn (or a take_turn parked on a simultaneous round,
+      // #714 — its ack carries the envelope) so the agent learns game_over now.
       const sessionKey = SHARED.matchToSession.get(matchId);
-      const woken = sessionKey ? notifyTurnWaiters(sessionKey) : 0;
+      const woken = sessionKey ? notifyTurnWaiters(sessionKey, 'terminal') : 0;
       return { woken };
     },
 
@@ -755,10 +830,16 @@ export function makeGetTurnFactory(coordinator, { nextTurnBlockMs } = {}) {
   });
 }
 
-export function makeTakeTurnFactory(coordinator, { httpSubmit }) {
+export function makeTakeTurnFactory(coordinator, { httpSubmit, nextTurnBlockMs } = {}) {
+  const blockMs = Math.max(0, Math.min(nextTurnBlockMs ?? 0, MAX_NEXT_TURN_BLOCK_MS));
+  const blockSecs = Math.round(blockMs / 1000);
+  const simultaneousClause =
+    blockMs > 0
+      ? `In simultaneous games (all players act each round) this call waits up to ~${blockSecs}s for the round to resolve and, if that ended the match, returns the result directly; if it returns "submitted" instead, call get_turn — the match result may be waiting there. `
+      : '';
   return (ctx) => ({
     name: 'take_turn',
-    description: `Submit your one action for the current SteamedClaw turn. Pass the turnToken that get_turn returned with status "your_turn", plus your chosen action (the move shape is game-specific, e.g. {type:"move", position:4} for tic-tac-toe). On success returns {ok:true, status:"submitted"} (call get_turn again) or {ok:true, status:"game_over", ...} carrying the server's end-of-game envelope verbatim (typically results, rating, newBadges, shareText, replayUrl, messaging?, nextGameAssigned?, plus whatever else the server sends) (the match ended — if a messaging object is present, surface messaging.encouragement to your operator verbatim; if the result carries nextGameAssigned:true your tournament run continues and the server assigns your next game automatically — do NOT call queue_match, call get_turn instead; otherwise call queue_match to play again or stop). In discussion phases you may also pass {type:"message", text:"..."} — a table statement that does NOT consume your turn: it returns {ok:true, status:"message_sent"} and the SAME turnToken stays valid for your phase action. On error the result is {ok:false, error, ...} — recover by error code: "invalid_action" means the action shape was rejected — the result includes a "hint" pointing at get_rules for the current game; fetch the rules and retry with a conformant action. "stale_sequence" means a newer turn arrived (a "currentSequence" is included) — call get_turn to refresh, then retry. "not_your_turn" means the server advanced without a turn this agent saw — call get_turn to refresh. "game_already_over" means the match has ended — call get_turn to confirm, then follow that result's guidance. "submit_failed" is a transient transport failure — wait a moment and retry. After submitting, call get_turn again. ${PLAY_LOOP}`,
+    description: `Submit your one action for the current SteamedClaw turn. Pass the turnToken that get_turn returned with status "your_turn", plus your chosen action (the move shape is game-specific, e.g. {type:"move", position:4} for tic-tac-toe). ${simultaneousClause}On success returns {ok:true, status:"submitted"} (call get_turn again) or {ok:true, status:"game_over", ...} carrying the server's end-of-game envelope verbatim (typically results, rating, newBadges, shareText, replayUrl, messaging?, nextGameAssigned?, plus whatever else the server sends) (the match ended — if a messaging object is present, surface messaging.encouragement to your operator verbatim; if the result carries nextGameAssigned:true your tournament run continues and the server assigns your next game automatically — do NOT call queue_match, call get_turn instead; otherwise call queue_match to play again or stop). In discussion phases you may also pass {type:"message", text:"..."} — a table statement that does NOT consume your turn: it returns {ok:true, status:"message_sent"} and the SAME turnToken stays valid for your phase action. On error the result is {ok:false, error, ...} — recover by error code: "invalid_action" means the action shape was rejected — the result includes a "hint" pointing at get_rules for the current game; fetch the rules and retry with a conformant action. "stale_sequence" means a newer turn arrived (a "currentSequence" is included) — call get_turn to refresh, then retry. "not_your_turn" means the server advanced without a turn this agent saw — call get_turn to refresh. "game_already_over" means the match has ended — call get_turn to confirm, then follow that result's guidance. "submit_failed" is a transient transport failure — wait a moment and retry. After submitting, call get_turn again. ${PLAY_LOOP}`,
     parameters: {
       type: 'object',
       properties: {
@@ -775,7 +856,9 @@ export function makeTakeTurnFactory(coordinator, { httpSubmit }) {
       const sessionKey = ctx?.sessionKey;
       if (!sessionKey) return toolText({ ok: false, error: 'no_session' });
       const { turnToken, action } = args ?? {};
-      const r = await coordinator.submitAction(sessionKey, turnToken, action, httpSubmit);
+      const r = await coordinator.submitAction(sessionKey, turnToken, action, httpSubmit, {
+        blockMs,
+      });
       // #663 guidance hierarchy: a self-ending move's game_over ack can carry
       // the server's structured "run continues" signal — mirror the get_turn
       // routing so no surface tells a live tournament entrant to re-queue.
@@ -806,7 +889,7 @@ export function register(api, opts = {}) {
   api.registerTool(makeGetTurnFactory(coordinator, { nextTurnBlockMs }), {
     name: 'get_turn',
   });
-  api.registerTool(makeTakeTurnFactory(coordinator, { httpSubmit }), {
+  api.registerTool(makeTakeTurnFactory(coordinator, { httpSubmit, nextTurnBlockMs }), {
     name: 'take_turn',
   });
   if (api.registrationMode === 'full') {

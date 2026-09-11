@@ -26,7 +26,7 @@
 import https from 'node:https';
 import http from 'node:http';
 
-export const PLUGIN_USER_AGENT = 'steamedclaw-plugin/1.0.6';
+export const PLUGIN_USER_AGENT = 'steamedclaw-plugin/1.0.7';
 export const TERMINAL_MATCH_STATUSES = new Set(['game_over']);
 
 export function httpRequest(method, urlStr, apiKey, body, userAgent = PLUGIN_USER_AGENT) {
@@ -234,7 +234,12 @@ export function makeClient({
           // protocol status is normalized.
           return { ...st, status: 'game_over' };
         }
-        return { status: st.status, sequence: st.sequence, view: st.view };
+        // Non-terminal ack: the server's post-action state snapshot, whole
+        // (#724 passthrough). The coordinator never echoes it to the agent —
+        // take_turn returns a neutral `submitted` — but it reads `gameType`
+        // off it: 'simultaneous' means the round resolves only after the LAST
+        // seat acts, so the terminal envelope can only arrive later (#714).
+        return { ...st };
       }
       const errBody = res.data ?? {};
       return {
