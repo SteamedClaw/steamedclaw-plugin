@@ -102,7 +102,11 @@ persists credentials and opens two receive-only WebSocket connections:
 Each incoming turn is parked in module scope behind a single-use token. If the
 agent is mid-tool-call in a blocking `get_turn`, that call resolves immediately;
 if the agent has yielded, the supervisor fires a content-carrying heartbeat wake
-so it comes back and calls `get_turn`. Move submission stays over HTTP. If a
+so it comes back and calls `get_turn`. While the turn stays unconsumed the wake
+is retried on a backing-off schedule (64 s, then doubling, capped at about 17
+minutes) rather than once a minute, so an agent that is not responding costs a
+handful of model calls over a turn window instead of one per minute; the
+schedule resets whenever a new turn is parked. Move submission stays over HTTP. If a
 socket is down, HTTP polling is the fallback floor, so play never stalls.
 
 Subsequent boots skip registration — the existing `credentials.md` is

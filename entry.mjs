@@ -61,11 +61,28 @@ const DEFAULT_NEXT_TURN_BLOCK_MS = 20000; //  blocking get_turn budget
 // runs discovery/state polling to catch events lost outside the 60s missed-event
 // buffer (agent socket down >60s, lost game_over).
 const SAFETY_NET_EVERY_TICKS = 15; //  ≈60s at the 4s tick
-// Re-wake cadence while a parked turn sits unconsumed. A single park-time wake is
-// lossy (absorbed when the agent is mid-turn), so we retry; but retrying faster
-// than ~64s trips OpenClaw's heartbeat FLOOD GUARD (≥5 runs within 60s defers
-// further wakes — verified in heartbeat-runner source).
-const REWAKE_EVERY_TICKS = 16; //  ≈64s at the 4s tick
+// Re-wake schedule while a parked turn sits unconsumed. A single park-time wake
+// is lossy (absorbed when the agent is mid-turn), so we retry — but every
+// re-wake is a full-context model call the operator pays for, and an agent that
+// is ignoring wakes (#707: 61 wakes over 65 min, one a minute until the server
+// timed the match out) must not cost a call a minute. So the retries back off:
+// the first re-wake fires REWAKE_BASE_MS after the park, each later one waits
+// twice as long, capped at REWAKE_MAX_MS; the schedule resets when a new turn
+// is parked and stops when the turn is consumed or the match ends. Standard
+// lane (65 min window): ~7 wakes instead of ~61. Fast lane (15 min): 4 instead
+// of ~14. The base must stay ≥ ~64s: faster trips OpenClaw's heartbeat FLOOD
+// GUARD (≥5 runs within 60s defers further wakes — verified in
+// heartbeat-runner source). The wake text itself is unchanged: it is a
+// general surface for every operator's agent, not a place for instructions
+// aimed at any one deployment's heartbeat rules.
+const REWAKE_BASE_MS = 64_000;
+const REWAKE_MAX_MS = 1_024_000; //  ≈17 min between re-wakes once backed off
+
+// Injectable clock for the re-wake schedule (tests drive it; prod = Date.now).
+let clock = () => Date.now();
+export function __setClock(fn) {
+  clock = typeof fn === 'function' ? fn : () => Date.now();
+}
 
 const TURN_INSTRUCTIONS =
   'You have a SteamedClaw turn. Call take_turn with this turnToken and a single legal action for the view shown.';
@@ -90,6 +107,11 @@ const DRIVER = {
   wakesFired: 0,
   backoffUntil: 0,
   tickCount: 0,
+  //  Re-wake schedule for the currently parked turn (#707): which sequence it
+  //  is for, how many re-wakes have fired for it, and when the next one is due.
+  rewakeSeq: -1,
+  rewakeCount: 0,
+  rewakeNextAt: 0,
   receiverStarted: false,
   registerInFlight: null,
 };
@@ -109,9 +131,20 @@ export function __resetDriver() {
   DRIVER.wakesFired = 0;
   DRIVER.backoffUntil = 0;
   DRIVER.tickCount = 0;
+  DRIVER.rewakeSeq = -1;
+  DRIVER.rewakeCount = 0;
+  DRIVER.rewakeNextAt = 0;
   DRIVER.receiverStarted = false;
   DRIVER.registerInFlight = null;
+  clock = () => Date.now();
   __resetReceiver();
+}
+
+// Start (or restart) the re-wake schedule for a freshly parked turn (#707).
+function scheduleRewake(sequence, now) {
+  DRIVER.rewakeSeq = sequence;
+  DRIVER.rewakeCount = 0;
+  DRIVER.rewakeNextAt = now + REWAKE_BASE_MS;
 }
 
 function toolText(obj) {
@@ -190,6 +223,7 @@ async function parkTurn(owner, { sequence, view }, via, { api, logger }) {
     DRIVER.parkedVia[via] += 1;
     logger?.info?.(`[steamedclaw-plugin] parked turn seq=${sequence} via=${via} woken=${woken}`);
     if (!woken) wakeAgent(api, 'steamedclaw-turn', logger, turnEventText(sequence));
+    scheduleRewake(sequence, clock()); //  the supervisor re-wakes on this schedule while unconsumed
     return true;
   } catch (err) {
     if (DRIVER.lastParkedSeq === sequence) DRIVER.lastParkedSeq = prevSeq;
@@ -470,13 +504,23 @@ export async function supervisorTick({ client, server, cfg, logger, receiver, ap
     }
     if (!DRIVER.matchId) return 'continue';
 
-    // Re-wake: while a parked turn sits unconsumed, re-fire the wake on a slow
-    // cadence (the park-time wake is lost if the agent was mid-turn). Stops on its
-    // own: the pull marks the token used, game-over flips the phase.
-    if (DRIVER.phase === 'in_match' && api && DRIVER.tickCount % REWAKE_EVERY_TICKS === 0) {
+    // Re-wake: while a parked turn sits unconsumed, re-fire the wake on the
+    // backed-off schedule (#707; see REWAKE_BASE_MS). The park-time wake is
+    // lost if the agent was mid-turn. Stops on its own: a SUBMIT marks the token
+    // used (status leaves your_turn) — merely reading the turn does not, an
+    // agent that read it and idled still owes the move — and game-over flips
+    // the phase.
+    if (DRIVER.phase === 'in_match' && api) {
       const cur = owner.nextTurn(DRIVER.boundSessionKey);
       if (cur.status === 'your_turn') {
-        wakeAgent(api, 'steamedclaw-turn-rewake', logger, turnEventText(cur.sequence));
+        const now = clock();
+        if (DRIVER.rewakeSeq !== cur.sequence) scheduleRewake(cur.sequence, now); //  defensive: unscheduled park
+        if (now >= DRIVER.rewakeNextAt) {
+          wakeAgent(api, 'steamedclaw-turn-rewake', logger, turnEventText(cur.sequence));
+          DRIVER.rewakeCount += 1;
+          DRIVER.rewakeNextAt =
+            now + Math.min(REWAKE_BASE_MS * 2 ** DRIVER.rewakeCount, REWAKE_MAX_MS);
+        }
       }
     }
 
