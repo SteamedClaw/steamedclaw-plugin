@@ -26,7 +26,7 @@
 import https from 'node:https';
 import http from 'node:http';
 
-export const PLUGIN_USER_AGENT = 'steamedclaw-plugin/1.0.8';
+export const PLUGIN_USER_AGENT = 'steamedclaw-plugin/1.0.9';
 export const TERMINAL_MATCH_STATUSES = new Set(['game_over']);
 
 export function httpRequest(method, urlStr, apiKey, body, userAgent = PLUGIN_USER_AGENT) {
@@ -49,10 +49,11 @@ export function httpRequest(method, urlStr, apiKey, body, userAgent = PLUGIN_USE
         let raw = '';
         res.on('data', (c) => (raw += c));
         res.on('end', () => {
+          //  headers ride along (#715): a 429 carries its wait in `retry-after`.
           try {
-            resolve({ status: res.statusCode, data: JSON.parse(raw) });
+            resolve({ status: res.statusCode, data: JSON.parse(raw), headers: res.headers });
           } catch {
-            resolve({ status: res.statusCode, data: raw });
+            resolve({ status: res.statusCode, data: raw, headers: res.headers });
           }
         });
       },
@@ -62,6 +63,15 @@ export function httpRequest(method, urlStr, apiKey, body, userAgent = PLUGIN_USE
     if (bodyStr !== undefined) req.write(bodyStr);
     req.end();
   });
+}
+
+// Milliseconds to wait before retrying, from a 429's `retry-after` header
+// (seconds; the server's rate limiter sets it on every 429). Undefined when
+// absent or unparseable — callers fall back to their own floor.
+export function retryAfterMsFrom(res) {
+  const raw = res?.headers?.['retry-after'];
+  const secs = Number.parseInt(Array.isArray(raw) ? raw[0] : raw, 10);
+  return Number.isFinite(secs) && secs >= 0 ? secs * 1000 : undefined;
 }
 
 // Build a transport client. `request` is injectable so tests drive it against an
@@ -105,7 +115,10 @@ export function makeClient({
         };
       }
       const err = typeof res.data?.error === 'string' ? res.data.error : 'register_failed';
-      return { ok: false, error: err, httpStatus: res.status };
+      // A 429 (registration is limited per IP) carries its wait in the
+      // retry-after header (#715): thread it so the tool can tell the model how
+      // long to wait instead of leaving it to hot-loop.
+      return { ok: false, error: err, httpStatus: res.status, retryAfterMs: retryAfterMsFrom(res) };
     },
 
     async queue(gameId, lane) {
@@ -116,7 +129,7 @@ export function makeClient({
           ok: false,
           error: res.status === 404 ? 'game_not_found' : err,
           httpStatus: res.status,
-          retryAfterMs: res.data?.retryAfterMs,
+          retryAfterMs: res.data?.retryAfterMs ?? retryAfterMsFrom(res),
         };
       }
       const b = res.data ?? {};
@@ -141,7 +154,7 @@ export function makeClient({
           ok: false,
           error: 'status_failed',
           httpStatus: res.status,
-          retryAfterMs: res.data?.retryAfterMs,
+          retryAfterMs: res.data?.retryAfterMs ?? retryAfterMsFrom(res),
         };
       }
       const b = res.data ?? {};
@@ -169,7 +182,7 @@ export function makeClient({
           ok: false,
           error: 'matches_failed',
           httpStatus: res.status,
-          retryAfterMs: res.data?.retryAfterMs,
+          retryAfterMs: res.data?.retryAfterMs ?? retryAfterMsFrom(res),
         };
       }
       const list = Array.isArray(res.data?.matches) ? res.data.matches : [];
@@ -189,7 +202,7 @@ export function makeClient({
           ok: false,
           error: 'state_failed',
           httpStatus: res.status,
-          retryAfterMs: res.data?.retryAfterMs,
+          retryAfterMs: res.data?.retryAfterMs ?? retryAfterMsFrom(res),
         };
       }
       const s =
@@ -245,10 +258,20 @@ export function makeClient({
       return {
         ok: false,
         error: typeof errBody.error === 'string' ? errBody.error : 'http_error',
-        details: typeof errBody.details === 'string' ? errBody.details : undefined,
+        // `details` is forwarded VERBATIM whatever its shape (#715): a game
+        // module's rejection sends a string, but a schema rejection
+        // (`invalid_input`) sends an ARRAY of field errors — the server's
+        // response schema declares the union — and dropping the array left the
+        // agent with a bare code and no idea which field was wrong.
+        details: errBody.details ?? undefined,
         currentSequence:
           typeof errBody.currentSequence === 'number' ? errBody.currentSequence : undefined,
         httpStatus: res.status,
+        //  A 429 on submit: the wait, body first for symmetry with the state
+        //  route's poll limiter (the one server path that sends it in the
+        //  body); on this route only the retry-after header is live (#715).
+        retryAfterMs:
+          res.status === 429 ? (errBody.retryAfterMs ?? retryAfterMsFrom(res)) : undefined,
       };
     },
 
@@ -303,7 +326,7 @@ export function makeClient({
           ok: false,
           error: 'fetch_failed',
           httpStatus: res.status,
-          retryAfterMs: res.data?.retryAfterMs,
+          retryAfterMs: res.data?.retryAfterMs ?? retryAfterMsFrom(res),
         };
       }
       if (typeof res.data !== 'object' || res.data === null) {
@@ -323,7 +346,7 @@ export function makeClient({
           ok: false,
           error: 'fetch_failed',
           httpStatus: res.status,
-          retryAfterMs: res.data?.retryAfterMs,
+          retryAfterMs: res.data?.retryAfterMs ?? retryAfterMsFrom(res),
         };
       }
       if (typeof res.data !== 'object' || res.data === null) {
@@ -344,7 +367,7 @@ export function makeClient({
           ok: false,
           error: 'fetch_failed',
           httpStatus: res.status,
-          retryAfterMs: res.data?.retryAfterMs,
+          retryAfterMs: res.data?.retryAfterMs ?? retryAfterMsFrom(res),
         };
       }
       return { ok: true, rounds: Array.isArray(res.data?.rounds) ? res.data.rounds : [] };
@@ -371,7 +394,7 @@ export function makeClient({
           ok: false,
           error: 'fetch_failed',
           httpStatus: res.status,
-          retryAfterMs: res.data?.retryAfterMs,
+          retryAfterMs: res.data?.retryAfterMs ?? retryAfterMsFrom(res),
         };
       }
       return { ok: true, series: Array.isArray(res.data?.series) ? res.data.series : [] };
@@ -389,7 +412,7 @@ export function makeClient({
           ok: false,
           error: 'fetch_failed',
           httpStatus: res.status,
-          retryAfterMs: res.data?.retryAfterMs,
+          retryAfterMs: res.data?.retryAfterMs ?? retryAfterMsFrom(res),
         };
       }
       return {

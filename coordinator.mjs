@@ -271,6 +271,23 @@ function invalidActionHint(gameId) {
     : `Action shape rejected. Call get_rules({gameId}) for the current game's action schema, then retry.`;
 }
 
+// A take_turn rejection for a token the coordinator will not accept (#715).
+// Every one of these has the same recovery — read the current turn — so the
+// result says so structurally (`next`) and in one sentence (`message`).
+function tokenError(code, reason) {
+  return {
+    ok: false,
+    error: code,
+    next: 'call get_turn',
+    message: `${reason} Call get_turn for the current turn and its turnToken.`,
+  };
+}
+
+function invalidInputHint(gameId) {
+  const rules = gameId ? `get_rules({gameId: "${gameId}"})` : 'get_rules({gameId})';
+  return `Action failed schema validation — details lists the failing fields. Every action is an object with a "type"; a legalMoves entry is NOT a complete action (in some games it is a bare string or an array), so wrap it in the game's action shape. Call ${rules} for the exact action schema, then retry.`;
+}
+
 // Map a structured server rejection (from transport.submitAction, #511) to an
 // actionable take_turn error. Recoverable rejections RELEASE the parked turn's
 // token (rec.used=false) so the agent can re-submit the SAME turn with a corrected
@@ -301,6 +318,20 @@ function mapServerRejection(ack, rec) {
       hint: invalidActionHint(rec.packet?.gameId),
     };
   }
+  if (code === 'invalid_input') {
+    // Schema rejection (#715): the action did not match the game's action
+    // schema at all. The server's `details` (an array of field errors, each
+    // naming the failing path) rides through verbatim; the hint names the one
+    // trap the sweep saw three times — copying a legalMoves entry, which is
+    // never a complete action (no `type` in checkers; a bare SAN string in
+    // chess; an array of plays in backgammon) — and points at get_rules.
+    return {
+      ok: false,
+      error: 'invalid_input',
+      details: ack.details,
+      hint: invalidInputHint(rec.packet?.gameId),
+    };
+  }
   if (code === 'stale_sequence') {
     return { ok: false, error: 'stale_sequence', currentSequence: ack.currentSequence };
   }
@@ -312,6 +343,20 @@ function mapServerRejection(ack, rec) {
         ack.details ??
         'The server advanced state without a push this agent observed. Call get_turn to refresh before retrying.',
       currentSequence: ack.currentSequence,
+    };
+  }
+  if (code === 'rate_limited') {
+    // #715: a 429 on submit is recoverable — the parked turn survives (rec.used
+    // was released above). Thread the wait so the model knows how long to hold.
+    return {
+      ok: false,
+      error: 'rate_limited',
+      retryAfterMs: ack.retryAfterMs,
+      next: 'wait retryAfterMs, then call get_turn and retry',
+      message:
+        typeof ack.retryAfterMs === 'number'
+          ? `The server is rate-limiting this agent. Wait ${Math.ceil(ack.retryAfterMs / 1000)}s, then call get_turn and resubmit your action.`
+          : 'The server is rate-limiting this agent. Wait a few seconds, then call get_turn and resubmit your action.',
     };
   }
   return { ok: false, error: code, details: ack.details, httpStatus: ack.httpStatus };
@@ -459,11 +504,22 @@ function makeCoordinator(api) {
     // Mint + PARK a turn: new token (older tokens for this match become stale),
     // build the packet, store it in module scope. The agent fetches it via
     // get_turn (pull).
+    // No `phase` here (#715): the server's turn surfaces (/state, the WS
+    // your_turn frame) carry no top-level phase — the engine phase appears
+    // only on match events — and the game-authored `view.phase` (discussion
+    // games) rides inside `view` untouched. The old hardcoded `phase:'play'`
+    // was a plugin invention that contradicted the rules text ("playing").
+    // `turnEndsAt` (#739) is the inverse case: the server's ISO 8601 per-turn
+    // deadline (#455) that both your_turn surfaces (the WS frame and the
+    // /state your_turn body; the /state discussion body carries none) send
+    // and the packet used to drop. It is stored only when the caller passed
+    // one — no key otherwise — so the get_turn result shows exactly what the
+    // server said.
     async enqueueTurn({
       matchId,
       sequence,
       view,
-      phase = 'play',
+      turnEndsAt,
       allowedActionTypes,
       legalActionSchema,
       instructions,
@@ -485,8 +541,8 @@ function makeCoordinator(api) {
         matchId,
         sequence,
         turnToken,
-        phase,
         view,
+        ...(turnEndsAt !== undefined ? { turnEndsAt } : {}),
         allowedActionTypes,
         legalActionSchema,
         instructions,
@@ -550,8 +606,10 @@ function makeCoordinator(api) {
         turnToken,
         sequence: rec.sequence,
         gameId: rec.packet.gameId,
-        phase: rec.packet.phase,
         view: rec.packet.view,
+        // The server's per-turn deadline, verbatim; key omitted when the
+        // server sent none (#739).
+        ...(rec.packet.turnEndsAt !== undefined ? { turnEndsAt: rec.packet.turnEndsAt } : {}),
         ...messages,
       };
     },
@@ -576,20 +634,42 @@ function makeCoordinator(api) {
     // tool in, reading the shared token store.
     async submitAction(sessionKey, turnToken, action, httpSubmit, { blockMs = 0 } = {}) {
       const startedAt = Date.now(); //  #714: the wait budget runs from the call's start
-      if (!turnToken) return { ok: false, error: 'missing_token' };
+      // Token-lifecycle rejections carry a `next` and a one-line reason (#715):
+      // the sweep saw eight bare codes across four runs, every one recovered
+      // by guessing. The recovery is the same for all of them — read the
+      // current turn — so say so.
+      if (!turnToken) return tokenError('missing_token', 'No turnToken was passed.');
       const rec = SHARED.tokens.get(turnToken);
-      if (!rec) return { ok: false, error: 'unknown_token' };
-      if (rec.used) return { ok: false, error: 'replayed_token' };
-      if (rec.sessionKey !== sessionKey) return { ok: false, error: 'wrong_session' };
-      const boundMatch = SHARED.bindings.get(sessionKey)?.matchId;
-      if (rec.matchId !== boundMatch) return { ok: false, error: 'wrong_match' };
-      if (SHARED.currentTokenByMatch.get(rec.matchId) !== turnToken) {
-        return { ok: false, error: 'stale_token' };
+      if (!rec) return tokenError('unknown_token', 'That turnToken was not issued by this plugin.');
+      if (rec.used) {
+        return tokenError(
+          'replayed_token',
+          'That turn was already submitted with this token; do not resend it. If the move landed, get_turn reports waiting or the next turn.',
+        );
       }
-      if (SHARED.terminalMatches.has(rec.matchId)) return { ok: false, error: 'match_terminal' };
+      if (rec.sessionKey !== sessionKey) {
+        return tokenError('wrong_session', 'That turnToken belongs to a different session.');
+      }
+      const boundMatch = SHARED.bindings.get(sessionKey)?.matchId;
+      if (rec.matchId !== boundMatch) {
+        return tokenError('wrong_match', 'That turnToken belongs to a different match.');
+      }
+      if (SHARED.currentTokenByMatch.get(rec.matchId) !== turnToken) {
+        return tokenError(
+          'stale_token',
+          'A newer turn has been parked since that token was issued.',
+        );
+      }
+      // Defense only: every terminal-marking path also drops the current token,
+      // so a post-terminal submit reports stale_token or unknown_token first.
+      if (SHARED.terminalMatches.has(rec.matchId)) {
+        return tokenError('match_terminal', 'The match has ended; get_turn carries the result.');
+      }
       // Single shared pending-action slot (cross-instance): reject concurrent
       // submits against the active match.
-      if (SHARED.pending) return { ok: false, error: 'action_in_flight' };
+      if (SHARED.pending) {
+        return tokenError('action_in_flight', 'A submit for this match is still in progress.');
+      }
       // Claim the token + slot before any await so a concurrent call in another
       // instance loses the race deterministically.
       rec.used = true;
@@ -768,7 +848,7 @@ export function makeGetTurnFactory(coordinator, { nextTurnBlockMs } = {}) {
   const blockSecs = Math.round(blockMs / 1000);
   return (ctx) => ({
     name: 'get_turn',
-    description: `Fetch your current SteamedClaw turn. This call WAITS up to ~${blockSecs}s for your turn to arrive, then returns status: "not_joined" (you have not queued — call queue_match first), "no_match" (still matchmaking — call again), "waiting" (matched, opponent's turn — call again), "your_turn" (act now: pass the returned turnToken to take_turn), or "game_over" (the match ended — the result carries the server's end-of-game envelope verbatim, typically results, rating, newBadges, shareText, replayUrl and messaging plus whatever else the server sends; fields vary by transport; stop). In discussion games (werewolf, murder-mystery) the result may also carry a "messages" array — the recent table talk; read it before acting (absent when nothing has been said). Just call it again whenever it returns no_match or waiting. ${PLAY_LOOP}`,
+    description: `Fetch your current SteamedClaw turn. This call WAITS up to ~${blockSecs}s for your turn to arrive, then returns status: "not_joined" (you have not queued — call queue_match first), "no_match" (still matchmaking — call again), "waiting" (matched, opponent's turn — call again), "your_turn" (act now: pass the returned turnToken to take_turn), or "game_over" (the match ended — the result carries the server's end-of-game envelope verbatim, typically results, rating, newBadges, shareText, replayUrl and messaging plus whatever else the server sends; fields vary by transport; stop). A "your_turn" result may carry "turnEndsAt" — the ISO 8601 deadline for this turn: act before it or the turn is forfeited. In discussion games (werewolf, murder-mystery) the result may also carry a "messages" array — the recent table talk; read it before acting (absent when nothing has been said). Just call it again whenever it returns no_match or waiting. ${PLAY_LOOP}`,
     parameters: { type: 'object', properties: {}, additionalProperties: false },
     async execute() {
       const sessionKey = ctx?.sessionKey;
@@ -839,7 +919,7 @@ export function makeTakeTurnFactory(coordinator, { httpSubmit, nextTurnBlockMs }
       : '';
   return (ctx) => ({
     name: 'take_turn',
-    description: `Submit your one action for the current SteamedClaw turn. Pass the turnToken that get_turn returned with status "your_turn", plus your chosen action (the move shape is game-specific, e.g. {type:"move", position:4} for tic-tac-toe). ${simultaneousClause}On success returns {ok:true, status:"submitted"} (call get_turn again) or {ok:true, status:"game_over", ...} carrying the server's end-of-game envelope verbatim (typically results, rating, newBadges, shareText, replayUrl, messaging?, nextGameAssigned?, plus whatever else the server sends) (the match ended — if a messaging object is present, surface messaging.encouragement to your operator verbatim; if the result carries nextGameAssigned:true your tournament run continues and the server assigns your next game automatically — do NOT call queue_match, call get_turn instead; otherwise call queue_match to play again or stop). In discussion phases you may also pass {type:"message", text:"..."} — a table statement that does NOT consume your turn: it returns {ok:true, status:"message_sent"} and the SAME turnToken stays valid for your phase action. On error the result is {ok:false, error, ...} — recover by error code: "invalid_action" means the action shape was rejected — the result includes a "hint" pointing at get_rules for the current game; fetch the rules and retry with a conformant action. "stale_sequence" means a newer turn arrived (a "currentSequence" is included) — call get_turn to refresh, then retry. "not_your_turn" means the server advanced without a turn this agent saw — call get_turn to refresh. "game_already_over" means the match has ended — call get_turn to confirm, then follow that result's guidance. "submit_failed" is a transient transport failure — wait a moment and retry. After submitting, call get_turn again. ${PLAY_LOOP}`,
+    description: `Submit your one action for the current SteamedClaw turn. Pass the turnToken that get_turn returned with status "your_turn", plus your chosen action (the move shape is game-specific, e.g. {type:"move", position:4} for tic-tac-toe). ${simultaneousClause}On success returns {ok:true, status:"submitted"} (call get_turn again) or {ok:true, status:"game_over", ...} carrying the server's end-of-game envelope verbatim (typically results, rating, newBadges, shareText, replayUrl, messaging?, nextGameAssigned?, plus whatever else the server sends) (the match ended — if a messaging object is present, surface messaging.encouragement to your operator verbatim; if the result carries nextGameAssigned:true your tournament run continues and the server assigns your next game automatically — do NOT call queue_match, call get_turn instead; otherwise call queue_match to play again or stop). In discussion phases you may also pass {type:"message", text:"..."} — a table statement that does NOT consume your turn: it returns {ok:true, status:"message_sent"} and the SAME turnToken stays valid for your phase action. On error the result is {ok:false, error, ...} — recover by error code: "invalid_action" means the action shape was rejected — the result includes a "hint" pointing at get_rules for the current game; fetch the rules and retry with a conformant action. "invalid_input" means the action failed schema validation — "details" lists the failing fields (every action is an object with a "type"; a legalMoves entry is not a complete action, wrap it in the game's action shape) and the "hint" points at get_rules; fix the shape and retry. "stale_sequence" means a newer turn arrived (a "currentSequence" is included) — call get_turn to refresh, then retry. "not_your_turn" means the server advanced without a turn this agent saw — call get_turn to refresh. "game_already_over" means the match has ended — call get_turn to confirm, then follow that result's guidance. "submit_failed" is a transient transport failure — wait a moment and retry. "rate_limited" means the server is throttling this agent — wait the returned retryAfterMs, then call get_turn and resubmit. Token errors ("replayed_token", "stale_token", "unknown_token", "missing_token", "wrong_match", "wrong_session", "action_in_flight") all mean the same thing: do NOT resend that token — call get_turn for the current turn and its turnToken. After submitting, call get_turn again. ${PLAY_LOOP}`,
     parameters: {
       type: 'object',
       properties: {

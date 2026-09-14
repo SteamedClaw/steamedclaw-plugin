@@ -53,6 +53,23 @@ export const MAX_SIMULTANEOUS_GAMES = 1;
 
 const DEFAULT_TICK_MS = 4000; //  supervisor cadence; WS events do the fast path
 const DEFAULT_RATE_LIMIT_BACKOFF_MS = 3000; //  floor backoff on a 429
+// Registration 429 without a usable retry-after header (#715): the server's
+// registration limit is per IP per hour, so a short floor would just invite the
+// next wasted call — wait a full window.
+const DEFAULT_REGISTER_BLOCK_MS = 60 * 60 * 1000;
+
+function rateLimitedRegisterResult(waitMs) {
+  const secs = Math.ceil(waitMs / 1000);
+  return {
+    ok: false,
+    error: 'rate_limited',
+    retryAfterMs: waitMs,
+    message:
+      waitMs > 0
+        ? `Registration is rate-limited per IP. Wait ${secs}s (retryAfterMs) before calling register_agent again — calls before then cannot succeed and are answered locally without contacting the server.`
+        : 'Registration was rate-limited but the server allows an immediate retry (retryAfterMs 0). Call register_agent again.',
+  };
+}
 // tournament_status 429 backoff cap: the wait is retry-after-honoring but
 // bounded — a tool call must return in seconds, not sit on a huge Retry-After.
 const TOURNAMENT_RETRY_CAP_MS = 15000;
@@ -78,7 +95,9 @@ const SAFETY_NET_EVERY_TICKS = 15; //  ≈60s at the 4s tick
 const REWAKE_BASE_MS = 64_000;
 const REWAKE_MAX_MS = 1_024_000; //  ≈17 min between re-wakes once backed off
 
-// Injectable clock for the re-wake schedule (tests drive it; prod = Date.now).
+// Injectable clock for every time-gated decision in this module — the re-wake
+// schedule, the 429 polling backoff, the registration block (tests drive it;
+// prod = Date.now).
 let clock = () => Date.now();
 export function __setClock(fn) {
   clock = typeof fn === 'function' ? fn : () => Date.now();
@@ -114,6 +133,9 @@ const DRIVER = {
   rewakeNextAt: 0,
   receiverStarted: false,
   registerInFlight: null,
+  //  Registration rate-limit block (#715): until this clock time, register_agent
+  //  answers locally with the remaining wait instead of re-hitting the server.
+  registerBlockedUntil: 0,
 };
 
 export function __resetDriver() {
@@ -136,6 +158,7 @@ export function __resetDriver() {
   DRIVER.rewakeNextAt = 0;
   DRIVER.receiverStarted = false;
   DRIVER.registerInFlight = null;
+  DRIVER.registerBlockedUntil = 0;
   clock = () => Date.now();
   __resetReceiver();
 }
@@ -156,7 +179,7 @@ function toolText(obj) {
 function rateLimited(res, logger) {
   if (res && res.httpStatus === 429) {
     const wait = Math.max(res.retryAfterMs ?? 0, DEFAULT_RATE_LIMIT_BACKOFF_MS);
-    DRIVER.backoffUntil = Date.now() + wait;
+    DRIVER.backoffUntil = clock() + wait;
     logger.info?.(`[steamedclaw-plugin] 429 rate-limited — backing off ${wait}ms`);
     return true;
   }
@@ -207,7 +230,11 @@ function turnEventText(sequence) {
 // mid-tool-call). The sequence is CLAIMED synchronously (so a concurrent WS/HTTP
 // park of the same turn dedupes) but ROLLED BACK if the park fails — otherwise a
 // failed enqueue would suppress every redelivery of that turn and lose it.
-async function parkTurn(owner, { sequence, view }, via, { api, logger }) {
+// `turnEndsAt` (#739) is the server's per-turn deadline (#455): both surfaces
+// this is fed from — the WS your_turn frame and the /state your_turn body —
+// carry it when known, and it rides through verbatim so the agent can pace
+// against the lane's turn timeout. Absent on the input ⇒ absent on the packet.
+async function parkTurn(owner, { sequence, view, turnEndsAt }, via, { api, logger }) {
   if (typeof sequence !== 'number' || sequence <= DRIVER.lastParkedSeq) return false;
   const prevSeq = DRIVER.lastParkedSeq;
   DRIVER.lastParkedSeq = sequence; //  claim before the await — concurrent parks dedupe here
@@ -216,7 +243,7 @@ async function parkTurn(owner, { sequence, view }, via, { api, logger }) {
       matchId: DRIVER.matchId,
       sequence,
       view,
-      phase: 'play',
+      turnEndsAt,
       instructions: TURN_INSTRUCTIONS,
     });
     DRIVER.turnsParked += 1;
@@ -403,7 +430,7 @@ export async function supervisorTick({ client, server, cfg, logger, receiver, ap
       // delivered. On the safety cadence, discover an unfinished match over
       // HTTP and adopt it; the attach block below opens it this same tick.
       if (!safety || DRIVER.paused || !DRIVER.boundSessionKey) return 'idle';
-      if (DRIVER.backoffUntil && Date.now() < DRIVER.backoffUntil) return 'idle';
+      if (DRIVER.backoffUntil && clock() < DRIVER.backoffUntil) return 'idle';
       if (typeof client.activeMatch !== 'function') return 'idle';
       const terminalCreds = readCredentials();
       if (!terminalCreds?.apiKey) return 'idle';
@@ -424,7 +451,7 @@ export async function supervisorTick({ client, server, cfg, logger, receiver, ap
 
     const owner = getOwnerCoordinator();
     if (!owner) return 'continue'; //  no full-mode owner yet
-    if (DRIVER.backoffUntil && Date.now() < DRIVER.backoffUntil) return 'continue';
+    if (DRIVER.backoffUntil && clock() < DRIVER.backoffUntil) return 'continue';
 
     // Credentials gate: the register tool writes them. No creds ⇒ idle.
     const creds = readCredentials();
@@ -617,7 +644,7 @@ function makeSupervisorService(api, client, server, cfg, logger, receiver) {
 function makeRegisterTool({ client, server, logger, receiver }) {
   return () => ({
     name: 'register_agent',
-    description: `Register this agent with the SteamedClaw server. Pass {name, model?} — name is your agent identity (1-64 chars, letters/numbers/hyphens/spaces/underscores, immutable, unique across SteamedClaw); model is optional (your LLM model id for stats). Use your SOUL-defined identity for name. Returns {ok, id?, name?, claimUrl?, verificationCode?, operatorNotice?, error?, message?}. On ok:true surface the operatorNotice in your next message so the operator can claim this agent. On error='already_registered' credentials exist — skip and call queue_match. On error='name_taken' pick a different name. After registering, call queue_match to play.`,
+    description: `Register this agent with the SteamedClaw server. Pass {name, model?} — name is your agent identity (1-64 chars, letters/numbers/hyphens/spaces/underscores, immutable, unique across SteamedClaw); model is optional (your LLM model id for stats). Use your SOUL-defined identity for name. Returns {ok, id?, name?, claimUrl?, verificationCode?, operatorNotice?, error?, message?, retryAfterMs?}. On ok:true surface the operatorNotice in your next message so the operator can claim this agent. On error='already_registered' credentials exist — skip and call queue_match. On error='name_taken' pick a different name. On error='rate_limited' registration is limited per IP: wait the returned retryAfterMs before calling again — never retry sooner, repeated calls cannot succeed until the window passes. After registering, call queue_match to play.`,
     parameters: {
       type: 'object',
       properties: {
@@ -653,6 +680,14 @@ function makeRegisterTool({ client, server, logger, receiver }) {
             ? `Already registered as "${existing.name}". Use queue_match, get_turn, etc.`
             : 'Already registered. Use queue_match.',
         });
+      }
+      // Rate-limit block (#715): registration is limited per IP on the server.
+      // Once a 429 lands, answer locally with the remaining wait until it
+      // passes — the sweep saw a model hot-loop 11 registrations in 40 s, each
+      // a wasted HTTP round trip that could never succeed inside the window.
+      const remainingBlockMs = DRIVER.registerBlockedUntil - clock();
+      if (remainingBlockMs > 0) {
+        return toolText(rateLimitedRegisterResult(remainingBlockMs));
       }
       // Memoize an in-flight register so two parallel calls settle on one POST.
       if (!DRIVER.registerInFlight) {
@@ -710,6 +745,17 @@ function makeRegisterTool({ client, server, logger, receiver }) {
       if (payload.ok === false && payload.error === 'name_taken') {
         payload.message =
           payload.message ?? `"${name}" is taken. Pick a different name and call again.`;
+      }
+      if (payload.ok === false && payload.httpStatus === 429) {
+        // #715: honor the server's retry-after; only a MISSING header falls
+        // back to the full-window default. Remember the block locally and tell
+        // the model exactly how long to wait.
+        const waitMs =
+          typeof payload.retryAfterMs === 'number' && payload.retryAfterMs >= 0
+            ? payload.retryAfterMs //  0 = "retry now" (a proxy can say so): no local block
+            : DEFAULT_REGISTER_BLOCK_MS;
+        DRIVER.registerBlockedUntil = clock() + waitMs;
+        return toolText(rateLimitedRegisterResult(waitMs));
       }
       return toolText(payload);
     },
