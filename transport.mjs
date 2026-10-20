@@ -5,9 +5,10 @@
 // coordinator drives.
 //
 // Contracts:
-//   POST /api/agents                {name, model?} -> 201 {id, apiKey, claim_url?, verification_code?}  (no auth)
-//   POST /api/matchmaking/queue     {gameId, lane} -> 200 {status, matchId?, position?}
-//   GET  /api/matchmaking/status?gameId=   -> {status, matchId?, position?}
+//   POST /api/agents                {name, model?} -> 201 {id, apiKey, claim_url?, verification_code?, messaging}  (no auth)
+//   POST /api/matchmaking/queue     {gameId, lane} -> 200 {status, matchId?, position?, messaging?, +match-found fields on matched}
+//                                                  -> 429 game_limit_reached {error, message, limit, windowHours, retryAfterSeconds, claimUrl?, messaging}
+//   GET  /api/matchmaking/status?gameId=   -> {status, matchId?, position?, +match-found fields on matched}
 //   GET  /api/agents/:id/matches?limit=    -> {matches:[...]}
 //   GET  /api/matches/:id/state?wait=false -> {status, sequence?, view?, results?}
 //   POST /api/matches/:id/action    {sequence, action} -> 200 {success, state{status, sequence, view, results, replayUrl}}
@@ -26,7 +27,7 @@
 import https from 'node:https';
 import http from 'node:http';
 
-export const PLUGIN_USER_AGENT = 'steamedclaw-plugin/1.0.9';
+export const PLUGIN_USER_AGENT = 'steamedclaw-plugin/1.0.10';
 export const TERMINAL_MATCH_STATUSES = new Set(['game_over']);
 
 export function httpRequest(method, urlStr, apiKey, body, userAgent = PLUGIN_USER_AGENT) {
@@ -74,6 +75,26 @@ export function retryAfterMsFrom(res) {
   return Number.isFinite(secs) && secs >= 0 ? secs * 1000 : undefined;
 }
 
+// A non-2xx answer, forwarded whole (#856). The server's body rides through as
+// it came (its `message` hint on the common 4xx codes, and on the queue's
+// game_limit_reached 429 the limit, window, retryAfterSeconds, claimUrl and
+// messaging) with the plugin's own keys set LAST: `error` is the server's code
+// when it sent one, else the caller's fallback; `httpStatus`; and
+// `retryAfterMs`, body first (the /state poll limiter sends it there with no
+// header) then the retry-after header (#715). A non-object body (a proxy's
+// HTML page) contributes nothing.
+function serverError(res, fallback) {
+  const body =
+    res?.data && typeof res.data === 'object' && !Array.isArray(res.data) ? res.data : {};
+  return {
+    ...body,
+    ok: false,
+    error: typeof body.error === 'string' ? body.error : fallback,
+    httpStatus: res?.status,
+    retryAfterMs: body.retryAfterMs ?? retryAfterMsFrom(res),
+  };
+}
+
 // Build a transport client. `request` is injectable so tests drive it against an
 // in-memory server without real sockets. `key` is mutable (setApiKey) because
 // the plugin acquires its API key at runtime when the register tool succeeds.
@@ -97,7 +118,10 @@ export function makeClient({
     },
 
     // POST /api/agents — no auth. Returns the claim surface so the register
-    // tool can hand the operator a claim link (folded from the published plugin).
+    // tool can hand the operator a claim link (folded from the published plugin)
+    // and, since #853, the server's `messaging` ({ toAgent, forOperator }): the
+    // welcome written for the agent and the claim line written for its human.
+    // The object rides whole so later additions need no plugin change.
     async register(name, model) {
       const body = { name };
       if (typeof model === 'string' && model.length > 0) body.model = model;
@@ -112,58 +136,45 @@ export function makeClient({
           claimUrl: typeof res.data.claim_url === 'string' ? res.data.claim_url : '',
           verificationCode:
             typeof res.data.verification_code === 'string' ? res.data.verification_code : '',
+          ...(res.data.messaging && typeof res.data.messaging === 'object'
+            ? { messaging: res.data.messaging }
+            : {}),
         };
       }
-      const err = typeof res.data?.error === 'string' ? res.data.error : 'register_failed';
       // A 429 (registration is limited per IP) carries its wait in the
       // retry-after header (#715): thread it so the tool can tell the model how
       // long to wait instead of leaving it to hot-loop.
-      return { ok: false, error: err, httpStatus: res.status, retryAfterMs: retryAfterMsFrom(res) };
+      return serverError(res, 'register_failed');
     },
 
+    // POST /api/matchmaking/queue. The 200 body rides whole (#856): `status`
+    // ('matched' | 'queued' | 'already_queued'), `matchId`, `position`, the
+    // server's `messaging.toAgent` (what happens next), and on `matched` the
+    // match-found fields (gameName, watchUrl, opponentDetails, messaging). A
+    // non-200 rides whole too: the game_limit_reached 429 carries message,
+    // limit, windowHours, retryAfterSeconds, claimUrl and messaging; a 404
+    // without a server code maps to game_not_found as before.
     async queue(gameId, lane) {
       const res = await call('POST', '/api/matchmaking/queue', { gameId, lane });
       if (res.status !== 200) {
-        const err = typeof res.data?.error === 'string' ? res.data.error : 'queue_failed';
-        return {
-          ok: false,
-          error: res.status === 404 ? 'game_not_found' : err,
-          httpStatus: res.status,
-          retryAfterMs: res.data?.retryAfterMs ?? retryAfterMsFrom(res),
-        };
+        return serverError(res, res.status === 404 ? 'game_not_found' : 'queue_failed');
       }
-      const b = res.data ?? {};
-      return {
-        ok: true,
-        status: b.status, //  'matched' | 'queued' | 'already_queued'
-        matchId: b.matchId,
-        position: typeof b.position === 'number' ? b.position : undefined,
-      };
+      const b = res.data && typeof res.data === 'object' ? res.data : {};
+      return { ...b, ok: true };
     },
 
     // Poll queue/match status. The server REQUIRES ?gameId and REJECTS ?lane
-    // (both 400). When paired it returns { status:'matched', matchId }; else
-    // { status:'queued'|'not_queued', position? }.
+    // (both 400). When paired it returns { status:'matched', matchId } plus the
+    // match-found fields (#856; the supervisor stores them for the agent's next
+    // read); else { status:'queued'|'not_queued', position? }. Whole body.
     async matchmakingStatus(gameId) {
       const path = gameId
         ? `/api/matchmaking/status?gameId=${encodeURIComponent(gameId)}`
         : '/api/matchmaking/status';
       const res = await call('GET', path);
-      if (res.status !== 200) {
-        return {
-          ok: false,
-          error: 'status_failed',
-          httpStatus: res.status,
-          retryAfterMs: res.data?.retryAfterMs ?? retryAfterMsFrom(res),
-        };
-      }
-      const b = res.data ?? {};
-      return {
-        ok: true,
-        status: b.status,
-        matchId: b.matchId,
-        position: typeof b.position === 'number' ? b.position : undefined,
-      };
+      if (res.status !== 200) return serverError(res, 'status_failed');
+      const b = res.data && typeof res.data === 'object' ? res.data : {};
+      return { ...b, ok: true };
     },
 
     // Discover an already-active match this agent is a participant in. Robust to
@@ -177,14 +188,7 @@ export function makeClient({
     async activeMatch(agentId, gameId) {
       if (!agentId) return { ok: false, error: 'no_agent_id' };
       const res = await call('GET', `/api/agents/${encodeURIComponent(agentId)}/matches?limit=5`);
-      if (res.status !== 200) {
-        return {
-          ok: false,
-          error: 'matches_failed',
-          httpStatus: res.status,
-          retryAfterMs: res.data?.retryAfterMs ?? retryAfterMsFrom(res),
-        };
-      }
+      if (res.status !== 200) return serverError(res, 'matches_failed');
       const list = Array.isArray(res.data?.matches) ? res.data.matches : [];
       const m = list.find(
         (x) =>
@@ -197,14 +201,7 @@ export function makeClient({
 
     async getState(matchId) {
       const res = await call('GET', `/api/matches/${encodeURIComponent(matchId)}/state?wait=false`);
-      if (res.status !== 200) {
-        return {
-          ok: false,
-          error: 'state_failed',
-          httpStatus: res.status,
-          retryAfterMs: res.data?.retryAfterMs ?? retryAfterMsFrom(res),
-        };
-      }
+      if (res.status !== 200) return serverError(res, 'state_failed');
       const s =
         res.data && typeof res.data === 'object' && !Array.isArray(res.data) ? res.data : {};
       // FULL PASSTHROUGH (#724): the /state body is returned whole; the plugin
@@ -264,6 +261,8 @@ export function makeClient({
         // response schema declares the union — and dropping the array left the
         // agent with a bare code and no idea which field was wrong.
         details: errBody.details ?? undefined,
+        //  The server's hint on the common 4xx codes (#856), when it sent one.
+        message: typeof errBody.message === 'string' ? errBody.message : undefined,
         currentSequence:
           typeof errBody.currentSequence === 'number' ? errBody.currentSequence : undefined,
         httpStatus: res.status,
@@ -278,7 +277,7 @@ export function makeClient({
     // GET /api/games — public catalog (no auth).
     async listGames() {
       const res = await call('GET', '/api/games', null, false);
-      if (res.status !== 200) return { ok: false, error: 'http_error', httpStatus: res.status };
+      if (res.status !== 200) return serverError(res, 'http_error');
       if (!Array.isArray(res.data))
         return { ok: false, error: 'malformed_response', httpStatus: res.status };
       return { ok: true, games: res.data };
@@ -286,8 +285,8 @@ export function makeClient({
 
     async getRules(gameId) {
       const res = await call('GET', `/api/games/${encodeURIComponent(gameId)}/rules`);
-      if (res.status === 404) return { ok: false, error: 'game_not_found', gameId };
-      if (res.status !== 200) return { ok: false, error: 'fetch_failed', httpStatus: res.status };
+      if (res.status === 404) return { ...serverError(res, 'game_not_found'), gameId };
+      if (res.status !== 200) return serverError(res, 'fetch_failed');
       const b = res.data ?? {};
       return {
         ok: true,
@@ -299,8 +298,8 @@ export function makeClient({
 
     async getStrategy(gameId) {
       const res = await call('GET', `/api/games/${encodeURIComponent(gameId)}/strategy`);
-      if (res.status === 404) return { ok: false, error: 'game_not_found', gameId };
-      if (res.status !== 200) return { ok: false, error: 'fetch_failed', httpStatus: res.status };
+      if (res.status === 404) return { ...serverError(res, 'game_not_found'), gameId };
+      if (res.status !== 200) return serverError(res, 'fetch_failed');
       const b = res.data ?? {};
       return {
         ok: true,
@@ -322,12 +321,7 @@ export function makeClient({
       const res = await call('GET', '/api/tournaments/active');
       if (res.status === 404) return { ok: true, tournament: null };
       if (res.status !== 200) {
-        return {
-          ok: false,
-          error: 'fetch_failed',
-          httpStatus: res.status,
-          retryAfterMs: res.data?.retryAfterMs ?? retryAfterMsFrom(res),
-        };
+        return serverError(res, 'fetch_failed');
       }
       if (typeof res.data !== 'object' || res.data === null) {
         return { ok: false, error: 'malformed_response', httpStatus: res.status };
@@ -342,12 +336,7 @@ export function makeClient({
       const res = await call('GET', `/api/tournaments/${encodeURIComponent(tournamentId)}/me`);
       if (res.status === 404) return { ok: true, entry: null };
       if (res.status !== 200) {
-        return {
-          ok: false,
-          error: 'fetch_failed',
-          httpStatus: res.status,
-          retryAfterMs: res.data?.retryAfterMs ?? retryAfterMsFrom(res),
-        };
+        return serverError(res, 'fetch_failed');
       }
       if (typeof res.data !== 'object' || res.data === null) {
         return { ok: false, error: 'malformed_response', httpStatus: res.status };
@@ -363,12 +352,7 @@ export function makeClient({
         `/api/tournaments/${encodeURIComponent(tournamentId)}/schedule`,
       );
       if (res.status !== 200) {
-        return {
-          ok: false,
-          error: 'fetch_failed',
-          httpStatus: res.status,
-          retryAfterMs: res.data?.retryAfterMs ?? retryAfterMsFrom(res),
-        };
+        return serverError(res, 'fetch_failed');
       }
       return { ok: true, rounds: Array.isArray(res.data?.rounds) ? res.data.rounds : [] };
     },
@@ -390,12 +374,7 @@ export function makeClient({
       );
       if (res.status === 404) return { ok: true, series: [] };
       if (res.status !== 200) {
-        return {
-          ok: false,
-          error: 'fetch_failed',
-          httpStatus: res.status,
-          retryAfterMs: res.data?.retryAfterMs ?? retryAfterMsFrom(res),
-        };
+        return serverError(res, 'fetch_failed');
       }
       return { ok: true, series: Array.isArray(res.data?.series) ? res.data.series : [] };
     },
@@ -408,12 +387,7 @@ export function makeClient({
         `/api/tournaments/${encodeURIComponent(tournamentId)}/standings`,
       );
       if (res.status !== 200) {
-        return {
-          ok: false,
-          error: 'fetch_failed',
-          httpStatus: res.status,
-          retryAfterMs: res.data?.retryAfterMs ?? retryAfterMsFrom(res),
-        };
+        return serverError(res, 'fetch_failed');
       }
       return {
         ok: true,

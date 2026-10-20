@@ -25,6 +25,9 @@ import {
   captureUndeliveredOutcome,
   takeCarryover,
   carryoverGuidance,
+  matchFoundBlock,
+  storeMatchFound,
+  takeMatchFound,
 } from './coordinator.mjs';
 import { makeClient, TERMINAL_MATCH_STATUSES } from './transport.mjs';
 import { readCredentials, writeCredentials, writeClaimIfAbsent } from './state.mjs';
@@ -316,6 +319,25 @@ function adoptMatch(matchId, gameId) {
   DRIVER.phase = 'queued';
 }
 
+// #856: a match discovered through the agent's match list (the HTTP floor's
+// activeMatch read, and post-terminal adoption) carries none of the
+// match-found fields; the status route's `matched` answer does, for a pending
+// or a live match (#678). One read, best-effort: a 429, a `queued` answer (the
+// agent is also queued for that game, ADR-018) or a different match stores
+// nothing, and nothing here can delay the attach.
+async function fetchMatchFoundViaStatus(client, matchId, gameId, logger) {
+  if (!matchId || !gameId || typeof client?.matchmakingStatus !== 'function') return;
+  try {
+    const s = await client.matchmakingStatus(gameId);
+    if (rateLimited(s, logger)) return; //  #715: a 429 here backs the poll loop off like any other
+    if (s?.ok && s.status === 'matched' && s.matchId === matchId) {
+      storeMatchFound(matchId, matchFoundBlock(s));
+    }
+  } catch (err) {
+    logger?.warn?.(`[steamedclaw-plugin] match-found read failed: ${err?.message ?? err}`);
+  }
+}
+
 // Build the WS receiver adapter with the supervisor's event handlers bound in.
 // makeWebSocket is injectable for tests.
 export function makeWsReceiver({ api, server, logger, makeWebSocket }) {
@@ -330,6 +352,9 @@ export function makeWsReceiver({ api, server, logger, makeWebSocket }) {
       // and reset the per-match state, exactly as a fresh queue_match would.
       if (DRIVER.matchId && DRIVER.phase !== 'terminal') return; //  live match — ignore extras
       adoptMatch(frame.matchId, frame.gameId ?? DRIVER.gameId);
+      // #856: the frame's match-found fields (gameName, watchUrl,
+      // opponentDetails, messaging.toAgent) wait for the agent's first read.
+      storeMatchFound(frame.matchId, matchFoundBlock(frame));
       const owner = getOwnerCoordinator();
       if (owner && DRIVER.boundSessionKey) {
         owner.attachMatch(DRIVER.boundSessionKey, DRIVER.matchId, DRIVER.matchGameId);
@@ -443,6 +468,7 @@ export async function supervisorTick({ client, server, cfg, logger, receiver, ap
       if (DRIVER.phase !== 'terminal') return 'continue';
       if (!am.ok || !am.matchId || am.matchId === DRIVER.matchId) return 'idle';
       adoptMatch(am.matchId, am.gameId ?? null);
+      await fetchMatchFoundViaStatus(client, am.matchId, am.gameId ?? null, logger);
       logger.info?.(
         `[steamedclaw-plugin] post-terminal discovery adopted matchId=${DRIVER.matchId}`,
       );
@@ -494,11 +520,13 @@ export async function supervisorTick({ client, server, cfg, logger, receiver, ap
         }
         if (activeId) {
           DRIVER.matchId = activeId;
+          await fetchMatchFoundViaStatus(client, activeId, resolvedGameId, logger);
         } else {
           const s = await client.matchmakingStatus(resolvedGameId);
           if (rateLimited(s, logger)) return 'continue';
           if (s.ok && s.status === 'matched' && s.matchId) {
             DRIVER.matchId = s.matchId;
+            storeMatchFound(s.matchId, matchFoundBlock(s)); //  #856: who you are playing, once
           } else if (s.ok && s.status === 'not_queued') {
             // Server dropped/consumed our entry without a match (a rare ~65-min
             // event at the server TTL). This is the ONE legitimate re-queue
@@ -644,7 +672,7 @@ function makeSupervisorService(api, client, server, cfg, logger, receiver) {
 function makeRegisterTool({ client, server, logger, receiver }) {
   return () => ({
     name: 'register_agent',
-    description: `Register this agent with the SteamedClaw server. Pass {name, model?} — name is your agent identity (1-64 chars, letters/numbers/hyphens/spaces/underscores, immutable, unique across SteamedClaw); model is optional (your LLM model id for stats). Use your SOUL-defined identity for name. Returns {ok, id?, name?, claimUrl?, verificationCode?, operatorNotice?, error?, message?, retryAfterMs?}. On ok:true surface the operatorNotice in your next message so the operator can claim this agent. On error='already_registered' credentials exist — skip and call queue_match. On error='name_taken' pick a different name. On error='rate_limited' registration is limited per IP: wait the returned retryAfterMs before calling again — never retry sooner, repeated calls cannot succeed until the window passes. After registering, call queue_match to play.`,
+    description: `Register this agent with the SteamedClaw server. Pass {name, model?} — name is your agent identity (1-64 chars, letters/numbers/hyphens/spaces/underscores, immutable, unique across SteamedClaw); model is optional (your LLM model id for stats). Use your SOUL-defined identity for name. Returns {ok, id?, name?, claimUrl?, verificationCode?, messaging?, guidance?, error?, message?, retryAfterMs?}. On ok:true relay messaging.forOperator to your operator in your next message so they can claim this agent (it carries the claim link); messaging.toAgent is the server's welcome written for you, and the plugin has already stored your API key for you. On error='already_registered' credentials exist — skip and call queue_match. On error='name_taken' pick a different name (message says so). On error='rate_limited' registration is limited per IP: wait the returned retryAfterMs before calling again — never retry sooner, repeated calls cannot succeed until the window passes. After registering, call queue_match to play.`,
     parameters: {
       type: 'object',
       properties: {
@@ -715,12 +743,6 @@ function makeRegisterTool({ client, server, logger, receiver }) {
             client.setApiKey(r.apiKey);
             receiver?.ensureStarted?.();
             logger.info?.(`[steamedclaw-plugin] registered agent "${name}" id=${r.id}`);
-            const codeSuffix = r.verificationCode
-              ? ` (verification code: ${r.verificationCode})`
-              : '';
-            const operatorNotice = r.claimUrl
-              ? `I registered on SteamedClaw. Link me to your operator account at ${r.claimUrl}${codeSuffix}.`
-              : '';
             return {
               ok: true,
               id: r.id,
@@ -730,10 +752,18 @@ function makeRegisterTool({ client, server, logger, receiver }) {
               // into the LLM tool result. The plugin already persisted it
               // (writeCredentials) and set it on the client (setApiKey) above, so the
               // agent never needs it in-context. claimUrl/verificationCode are the
-              // operator-claim surface (non-secret) and also live inside operatorNotice.
+              // operator-claim surface (non-secret).
               claimUrl: r.claimUrl || null,
               verificationCode: r.verificationCode || null,
-              operatorNotice,
+              // #856 (planning/132 T1): the server's welcome, whole. toAgent is
+              // written for the agent; forOperator is the claim line written
+              // for its human and replaces the plugin's old operatorNotice, so
+              // every play path hands the operator the same words. The plugin
+              // adds one structural line: the welcome tells the agent to store
+              // its API key, and here the plugin has already done that.
+              ...(r.messaging && typeof r.messaging === 'object' ? { messaging: r.messaging } : {}),
+              guidance:
+                'Relay messaging.forOperator to your operator so they can claim this agent; messaging.toAgent is written for you. The plugin has already stored your API key and sends it on every call, so you never need it.',
             };
           } finally {
             DRIVER.registerInFlight = null;
@@ -767,7 +797,7 @@ function makeQueueTool({ client, server, cfg, logger, receiver, coordinator }) {
   const maxGames = cfg.maxSimultaneousGames ?? MAX_SIMULTANEOUS_GAMES;
   return (ctx) => ({
     name: 'queue_match',
-    description: `Enter SteamedClaw matchmaking for a game. Pass {gameId, lane?} — gameId is a SteamedClaw game id (call list_games to discover ids); optional lane selects the per-turn time budget — "fast" (the default: short per-turn window, best for responsive WebSocket play) or "standard" (long per-turn window, for agents on a slow heartbeat/poll cadence) — omit for the default ("${DEFAULT_LANE}"). This binds your session and holds the queue. Returns {ok, status, matchId?, game?, position?, error?}. On status="matched" a match formed — call get_turn (it blocks until your turn). On status="queued" no pairing yet — call get_turn and it will wake/resolve when a match is found; do NOT spam queue. On status="already_queued" you are already in queue. On error="already_in_match" finish the current match first. On error="game_not_allowed" the operator restricted which games this plugin may play. On error="not_registered" call register_agent first. After a match, loop get_turn / take_turn to game-over.`,
+    description: `Enter SteamedClaw matchmaking for a game. Pass {gameId, lane?} — gameId is a SteamedClaw game id (call list_games to discover ids); optional lane selects the per-turn time budget — "fast" (the default: short per-turn window, best for responsive WebSocket play) or "standard" (long per-turn window, for agents on a slow heartbeat/poll cadence) — omit for the default ("${DEFAULT_LANE}"). This binds your session and holds the queue. Returns {ok, status, matchId?, game?, position?, messaging?, error?, message?}. messaging.toAgent is the server's line for you about what happens next. On status="matched" a match formed and the result also carries gameName, opponentDetails (each opponent's name and, when rated, rating) and watchUrl (a link your operator can watch at); call get_turn (it blocks until your turn). On status="matched" with recovered:true a match of yours was already live on the server (for example because this gateway restarted mid-match) and was picked up again instead of queueing; call get_turn. On status="queued" no pairing yet — call get_turn and it will wake/resolve when a match is found; do NOT spam queue. On error="rate_limited" the server throttled the live-match check that runs before queueing: wait retryAfterMs when it is given, then call queue_match again. On status="already_queued" you are already in queue. On error="already_in_match" finish the current match first. On error="game_not_allowed" the operator restricted which games this plugin may play. On error="not_registered" call register_agent first. On error="game_limit_reached" you have used your games for the rolling window: the result carries the server's message, limit, windowHours, retryAfterSeconds and retryAfterMs; wait that long before queueing again, and if messaging.forOperator is present relay it to your operator (it carries the claim link that raises the limit). After a match, loop get_turn / take_turn to game-over.`,
     parameters: {
       type: 'object',
       properties: {
@@ -855,11 +885,79 @@ function makeQueueTool({ client, server, cfg, logger, receiver, coordinator }) {
           adopted.previousMatchResult = carried;
           adopted.guidance = carryoverGuidance(carried);
         }
+        // #856: this is the adopted match's first agent-facing result, so the
+        // stored match-found block rides it (and is consumed) here.
+        const matchFound = takeMatchFound(DRIVER.matchId);
+        if (matchFound) adopted.matchFound = matchFound;
         return toolText(adopted);
       }
 
       const resolvedLane = lane ?? cfg.defaultLane ?? DEFAULT_LANE;
       client.setApiKey(creds.apiKey);
+
+      // #828: the plugin's match state is in memory. After the agent's own
+      // gateway restarts mid-match nothing is tracked here while the server
+      // still holds a live match for this agent; enqueueing now would leave a
+      // stale queue entry behind once the supervisor re-discovers that match,
+      // and the matchmaker would later pair it into a game the agent never
+      // asked for. So before a fresh queue the server is asked (the same
+      // active-match read the supervisor uses, with no game filter: any live
+      // match occupies the single slot) and a live match is adopted instead.
+      // A 429 on that read answers rate_limited (never enqueue blind, never
+      // hot-loop, #715); any other failure falls through to the queue POST.
+      if (typeof client.activeMatch === 'function') {
+        let am = null;
+        try {
+          am = await client.activeMatch(creds.agentId);
+        } catch (err) {
+          logger.warn?.(`[steamedclaw-plugin] live-match read failed: ${err?.message ?? err}`);
+        }
+        if (am && !am.ok && am.httpStatus === 429) {
+          const wait =
+            typeof am.retryAfterMs === 'number'
+              ? `Wait retryAfterMs (${Math.ceil(am.retryAfterMs / 1000)}s) before calling queue_match again.`
+              : 'Wait a few seconds before calling queue_match again.';
+          return toolText({
+            ...am,
+            ok: false,
+            error: 'rate_limited',
+            httpStatus: 429,
+            guidance: `The server is rate-limiting this agent. ${wait}`,
+          });
+        }
+        if (am?.ok && am.matchId) {
+          adoptMatch(am.matchId, am.gameId ?? null);
+          coordinator.bindSession(ctx?.sessionKey, ctx?.agentId);
+          coordinator.clearSessionMatch(ctx?.sessionKey);
+          DRIVER.boundSessionKey = ctx?.sessionKey ?? DRIVER.boundSessionKey;
+          DRIVER.boundAgentId = ctx?.agentId ?? DRIVER.boundAgentId;
+          if (DRIVER.matchGameId) DRIVER.gameId = DRIVER.matchGameId;
+          DRIVER.paused = false;
+          receiver?.ensureStarted?.();
+          await fetchMatchFoundViaStatus(client, am.matchId, am.gameId ?? null, logger);
+          const recovered = {
+            ok: true,
+            status: 'matched',
+            matchId: DRIVER.matchId,
+            game: DRIVER.matchGameId ?? gameId,
+            recovered: true,
+            guidance:
+              'A match of yours was already live on the server (for example because this gateway restarted mid-match), so it was picked up again instead of queueing. Call get_turn; it blocks until your turn.',
+          };
+          const carried = takeCarryover(DRIVER.matchId);
+          if (carried) {
+            recovered.previousMatchResult = carried;
+            recovered.guidance = `${carryoverGuidance(carried)} ${recovered.guidance}`;
+          }
+          const matchFound = takeMatchFound(DRIVER.matchId);
+          if (matchFound) recovered.matchFound = matchFound;
+          logger.info?.(
+            `[steamedclaw-plugin] queue_match recovered live matchId=${DRIVER.matchId}`,
+          );
+          return toolText(recovered);
+        }
+      }
+
       // Fresh queue: the slot check above guaranteed no ACTIVE match, so clear any
       // prior (terminal) match — both the supervisor's per-match state and the
       // coordinator binding — so discovery + match_found pick up the NEW match and
@@ -888,19 +986,41 @@ function makeQueueTool({ client, server, cfg, logger, receiver, coordinator }) {
       } catch (err) {
         return toolText({ ok: false, error: 'queue_failed', message: String(err?.message ?? err) });
       }
-      if (!q.ok) return toolText({ ok: false, error: q.error, httpStatus: q.httpStatus });
+      // #856: every server body rides the result whole. On a rejection that is
+      // the server's hint and, on the game_limit_reached 429, the limit, the
+      // window, the real wait and the claim line for the operator; the plugin
+      // adds only a `guidance` line (never `message`, which is the server's).
+      if (!q.ok) {
+        const guidance = [];
+        if (typeof q.retryAfterMs === 'number' && q.retryAfterMs > 0) {
+          guidance.push(
+            `Wait retryAfterMs (${Math.ceil(q.retryAfterMs / 1000)}s) before calling queue_match again.`,
+          );
+        }
+        if (typeof q.messaging?.forOperator === 'string') {
+          guidance.push(
+            'Relay messaging.forOperator to your operator; messaging.toAgent is written for you.',
+          );
+        }
+        return toolText(guidance.length > 0 ? { ...q, guidance: guidance.join(' ') } : q);
+      }
+      // A `matched` answer is already this match's first agent-facing result:
+      // its match-found fields ride here, whole, and are NOT stored for a
+      // second delivery on get_turn. The server pushes match_found over
+      // /ws/agent while it forms the match, so that frame can land BEFORE this
+      // reply and the WS handler will already have stored the same block for
+      // the then-untracked match: drop that copy, or the next get_turn would
+      // repeat what this result carries.
       if (q.status === 'matched' && q.matchId) {
+        takeMatchFound(q.matchId);
         DRIVER.matchId = q.matchId;
         DRIVER.matchGameId = gameId;
         DRIVER.phase = 'queued'; //  supervisor's attach block opens the game socket
-        return toolText({ ok: true, status: 'matched', matchId: q.matchId, game: gameId });
-      }
-      if (q.status === 'already_queued') {
-        DRIVER.phase = 'queued';
-        return toolText({ ok: true, status: 'already_queued', game: gameId, position: q.position });
+        return toolText({ ...q, ok: true, status: 'matched', matchId: q.matchId, game: gameId });
       }
       DRIVER.phase = 'queued';
-      return toolText({ ok: true, status: 'queued', game: gameId, position: q.position });
+      const status = q.status === 'already_queued' ? 'already_queued' : 'queued';
+      return toolText({ ...q, ok: true, status, game: gameId });
     },
   });
 }
@@ -1007,7 +1127,7 @@ function makeTournamentStatusTool({ client, server, sleep }) {
 
   return () => ({
     name: 'tournament_status',
-    description: `Check SteamedClaw tournament status — read-only awareness. No parameters; example call: tournament_status(). Returns {ok, state, ...} where state is one of: "none_active" — no tournament running; "not_registered" — a tournament exists (summary included) but you have no SteamedClaw registration (entry requires a registered agent your owner has claimed); "not_entered" — tournament summary + enterUrl: entry happens ONLY on the owner portal, so tell your OWNER to visit enterUrl (you cannot enter); "entered" — your entry plus round (stage, roundNumber, window times), series (your matchup this round — normally exactly one: seriesId, opponent id and name, bestOfN, matchIds, outcome; empty in table formats; rounds run one at a time, so you play one match at a time), and standing (your rank row); "withdrawn" — you were entered but withdrew. This tool does NOT enter or withdraw you from tournaments and does not play matches — entry is an owner action on the portal, and tournament matches arrive automatically as normal match_found pushes (play them via get_turn and take_turn as usual). On error:"rate_limited", wait a few seconds and call again.`,
+    description: `Check SteamedClaw tournament status — read-only awareness. No parameters; example call: tournament_status(). Returns {ok, state, ...} where state is one of: "none_active" — no tournament running; "not_registered" — a tournament exists (summary included) but you have no SteamedClaw registration (entry requires a registered agent your owner has claimed); "not_entered" — tournament summary + enterUrl: entry happens ONLY on the owner portal, so tell your OWNER to visit enterUrl (you cannot enter); "entered" — your entry plus round (stage, roundNumber, window times), series (your matchup this round — normally exactly one: seriesId, opponent id and name, bestOfN, matchIds, outcome; empty in table formats; rounds run one at a time, so you play one match at a time), and standing (your rank row); "withdrawn" — you were entered but withdrew. This tool does NOT enter or withdraw you from tournaments and does not play matches — entry is an owner action on the portal, and tournament matches arrive as normal match_found pushes (play them via get_turn and take_turn as usual) once you have called queue_match at least once since this plugin started, because that call binds your session. If you are entered and get_turn returns not_joined after the round window opens, call queue_match for the tournament game: the pending tournament match is adopted instead of queueing. On error:"rate_limited", wait a few seconds and call again.`,
     parameters: { type: 'object', properties: {}, additionalProperties: false },
     async execute() {
       // Bounded 429 handling (feedback_http_client_handle_429): ONE floored,
