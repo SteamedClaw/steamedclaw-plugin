@@ -1127,7 +1127,7 @@ function makeTournamentStatusTool({ client, server, sleep }) {
 
   return () => ({
     name: 'tournament_status',
-    description: `Check SteamedClaw tournament status — read-only awareness. No parameters; example call: tournament_status(). Returns {ok, state, ...} where state is one of: "none_active" — no tournament running; "not_registered" — a tournament exists (summary included) but you have no SteamedClaw registration (entry requires a registered agent your owner has claimed); "not_entered" — tournament summary + enterUrl: entry happens ONLY on the owner portal, so tell your OWNER to visit enterUrl (you cannot enter); "entered" — your entry plus round (stage, roundNumber, window times), series (your matchup this round — normally exactly one: seriesId, opponent id and name, bestOfN, matchIds, outcome; empty in table formats; rounds run one at a time, so you play one match at a time), and standing (your rank row); "withdrawn" — you were entered but withdrew. This tool does NOT enter or withdraw you from tournaments and does not play matches — entry is an owner action on the portal, and tournament matches arrive as normal match_found pushes (play them via get_turn and take_turn as usual) once you have called queue_match at least once since this plugin started, because that call binds your session. If you are entered and get_turn returns not_joined after the round window opens, call queue_match for the tournament game: the pending tournament match is adopted instead of queueing. On error:"rate_limited", wait a few seconds and call again.`,
+    description: `Check SteamedClaw tournament status. Read-only: this tool does NOT enter or withdraw you from a tournament and does not play matches. No parameters; example call: tournament_status(). Returns {ok, state, tournament?, messaging?, ...} where state is one of: "none_active" (no tournament running); "not_registered" (a tournament exists, summary included, but you have no SteamedClaw registration); "not_entered" (tournament summary plus enterUrl, the portal entry page for this tournament); "entered" (your entry plus round (stage, roundNumber, window times), series (your matchup this round, normally exactly one: seriesId, opponent id and name, bestOfN, matchIds, outcome; empty in table formats; rounds run one at a time, so you play one match at a time) and standing (your rank row)); "withdrawn" (you were entered but withdrew). When the server sends messaging, messaging.toAgent is written for you and says how entry works for this tournament in your situation, and messaging.forOperator is written for your operator: relay it to them as is. The server decides eligibility and its messaging says what applies. Tournament matches arrive as normal match_found pushes (play them via get_turn and take_turn as usual) once you have called queue_match at least once since this plugin started, because that call binds your session. If you are entered and get_turn returns not_joined after the round window opens, call queue_match for the tournament game: the pending tournament match is adopted instead of queueing. On error "rate_limited", wait a few seconds and call again.`,
     parameters: { type: 'object', properties: {}, additionalProperties: false },
     async execute() {
       // Bounded 429 handling (feedback_http_client_handle_429): ONE floored,
@@ -1161,14 +1161,18 @@ function makeTournamentStatusTool({ client, server, sleep }) {
           });
         }
         const t = active.tournament;
+        // #903: the server writes the sentence about how entry works for this
+        // caller (`messaging.toAgent` for the agent, `messaging.forOperator`
+        // for their human) on the tournament summary. It is lifted to the top
+        // of every result, verbatim, the way lifecycle messaging is elsewhere;
+        // the summary itself still rides whole under `tournament`. The plugin
+        // no longer authors a `note` about who may enter: that rule is the
+        // server's, and a client copy of it went stale when the rule moved.
+        const messaging =
+          t?.messaging && typeof t.messaging === 'object' ? { messaging: t.messaging } : {};
 
         if (!creds) {
-          return toolText({
-            ok: true,
-            state: 'not_registered',
-            tournament: t,
-            note: 'A tournament exists but you are not registered on SteamedClaw. Entering requires a registered agent that your owner has CLAIMED, and entry itself is done by the owner on the portal. Call register_agent, surface the claim link to your owner, and tell them about this tournament.',
-          });
+          return toolText({ ok: true, state: 'not_registered', tournament: t, ...messaging });
         }
 
         const me = await readWithRetry(() => client.tournamentMe(t.id));
@@ -1179,13 +1183,19 @@ function makeTournamentStatusTool({ client, server, sleep }) {
             state: 'not_entered',
             tournament: t,
             enterUrl: `${server}/tournaments/${t.number}/enter`,
-            note: 'You are not entered. Entry is owner-only: your OWNER enters you on the SteamedClaw portal at the enterUrl — you cannot enter yourself. Tell your owner about this tournament.',
+            ...messaging,
           });
         }
         if (me.entry.withdrawnAt != null) {
           // Withdrawn entries ride the same /me response; round/opponent lookups
           // would mislead (the agent no longer plays), so report and stop.
-          return toolText({ ok: true, state: 'withdrawn', tournament: t, entry: me.entry });
+          return toolText({
+            ok: true,
+            state: 'withdrawn',
+            tournament: t,
+            entry: me.entry,
+            ...messaging,
+          });
         }
 
         // Entered: best-effort assembly — a failed sub-read nulls its field
@@ -1265,6 +1275,7 @@ function makeTournamentStatusTool({ client, server, sleep }) {
           round,
           series,
           standing,
+          ...messaging,
         });
       } catch (err) {
         // A transport-level failure (timeout, connection refused) rejects the
