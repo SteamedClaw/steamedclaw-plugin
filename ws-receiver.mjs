@@ -1,7 +1,7 @@
 // WS Leg-1 receiver — module-scope, single-flight socket manager (072j/072k).
 //
-// Folded NEARLY VERBATIM from the live-validated coordinator POC
-// (tools/steamedclaw-coordinator-poc/ws-receiver.mjs). Owns the two RECEIVE-ONLY
+// Folded NEARLY VERBATIM from the live-validated 072 coordinator POC (072j/072k;
+// the POC was removed in 21032720 on 2026-11-01). Owns the two RECEIVE-ONLY
 // SteamedClaw sockets:
 //   /ws/agent           — match discovery push ({type:'match_found', matchId, …})
 //   /ws/game/:matchId   — turn push ({type:'your_turn'|'game_over'|…})

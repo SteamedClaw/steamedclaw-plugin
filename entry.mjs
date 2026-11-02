@@ -141,6 +141,11 @@ const DRIVER = {
   registerBlockedUntil: 0,
 };
 
+// Test-only view of the supervisor state (assertions only — never used by logic).
+export function __peekDriver() {
+  return DRIVER;
+}
+
 export function __resetDriver() {
   DRIVER.boundSessionKey = null;
   DRIVER.boundAgentId = null;
@@ -445,7 +450,18 @@ export async function supervisorTick({ client, server, cfg, logger, receiver, ap
   try {
     DRIVER.tickCount += 1;
     const safety = DRIVER.tickCount % SAFETY_NET_EVERY_TICKS === 0;
-    if (DRIVER.phase === 'terminal') {
+    // The same discovery serves a bound IDLE phase (#922): an entered agent
+    // whose tournament_status call bound its session before any match
+    // existed. Its match is created server-side with no queue entry; with the
+    // agent socket up the match_found push finds it, so idle spends nothing
+    // then, and on the HTTP floor (wsEnabled:false, or the socket not yet up)
+    // this read is the only path that finds it. Unbound idle costs nothing.
+    const agentSocketUp = Boolean(receiver && receiver.status().agentReady);
+    if (
+      DRIVER.phase === 'terminal' ||
+      (DRIVER.phase === 'idle' && DRIVER.boundSessionKey && !agentSocketUp)
+    ) {
+      const phaseAtRead = DRIVER.phase;
       // Game over — idle, but do NOT go blind (#663): a tournament Bo-N series
       // (or the next round) creates this agent's next match server-side with
       // no re-queue, and its match_found push can even race the game_over
@@ -465,12 +481,12 @@ export async function supervisorTick({ client, server, cfg, logger, receiver, ap
       const am = await client.activeMatch(terminalCreds.agentId);
       if (rateLimited(am, logger)) return 'idle';
       // Re-check after the await: a WS match_found may have adopted first.
-      if (DRIVER.phase !== 'terminal') return 'continue';
+      if (DRIVER.phase !== phaseAtRead || DRIVER.paused) return 'continue';
       if (!am.ok || !am.matchId || am.matchId === DRIVER.matchId) return 'idle';
       adoptMatch(am.matchId, am.gameId ?? null);
       await fetchMatchFoundViaStatus(client, am.matchId, am.gameId ?? null, logger);
       logger.info?.(
-        `[steamedclaw-plugin] post-terminal discovery adopted matchId=${DRIVER.matchId}`,
+        `[steamedclaw-plugin] ${phaseAtRead === 'idle' ? 'idle' : 'post-terminal'} discovery adopted matchId=${DRIVER.matchId}`,
       );
       //  fall through — the attach block below binds + opens the game socket now
     }
@@ -863,14 +879,9 @@ function makeQueueTool({ client, server, cfg, logger, receiver, coordinator }) {
         // the pending match instead; the supervisor's attach block completes
         // the join on the next tick.
         client.setApiKey(creds.apiKey);
-        coordinator.bindSession(ctx?.sessionKey, ctx?.agentId);
-        coordinator.clearSessionMatch(ctx?.sessionKey); //  drop any finished-match binding
-        DRIVER.boundSessionKey = ctx?.sessionKey ?? DRIVER.boundSessionKey;
-        DRIVER.boundAgentId = ctx?.agentId ?? DRIVER.boundAgentId;
-        if (DRIVER.matchGameId) DRIVER.gameId = DRIVER.matchGameId;
+        bindCallerForMatch(ctx, { coordinator, receiver, rebind: true });
         DRIVER.phase = 'queued'; //  the attach block completes the join
         DRIVER.paused = false;
-        receiver?.ensureStarted?.();
         const adopted = {
           ok: true,
           status: 'matched',
@@ -927,13 +938,8 @@ function makeQueueTool({ client, server, cfg, logger, receiver, coordinator }) {
         }
         if (am?.ok && am.matchId) {
           adoptMatch(am.matchId, am.gameId ?? null);
-          coordinator.bindSession(ctx?.sessionKey, ctx?.agentId);
-          coordinator.clearSessionMatch(ctx?.sessionKey);
-          DRIVER.boundSessionKey = ctx?.sessionKey ?? DRIVER.boundSessionKey;
-          DRIVER.boundAgentId = ctx?.agentId ?? DRIVER.boundAgentId;
-          if (DRIVER.matchGameId) DRIVER.gameId = DRIVER.matchGameId;
+          bindCallerForMatch(ctx, { coordinator, receiver, rebind: true });
           DRIVER.paused = false;
-          receiver?.ensureStarted?.();
           await fetchMatchFoundViaStatus(client, am.matchId, am.gameId ?? null, logger);
           const recovered = {
             ok: true,
@@ -971,14 +977,10 @@ function makeQueueTool({ client, server, cfg, logger, receiver, coordinator }) {
       // leave_queue pause (symmetric resume). bindSession writes module-scope
       // state, so it does not require ownership — the binding is visible to the
       // owner's supervisor regardless of which instance binds.
-      coordinator.bindSession(ctx?.sessionKey, ctx?.agentId);
-      coordinator.clearSessionMatch(ctx?.sessionKey); //  drop any finished-match binding
-      DRIVER.boundSessionKey = ctx?.sessionKey ?? DRIVER.boundSessionKey;
-      DRIVER.boundAgentId = ctx?.agentId ?? DRIVER.boundAgentId;
+      bindCallerForMatch(ctx, { coordinator, receiver, rebind: true });
       DRIVER.gameId = gameId;
       DRIVER.lane = resolvedLane;
       DRIVER.paused = false;
-      receiver?.ensureStarted?.();
 
       let q;
       try {
@@ -1109,8 +1111,163 @@ const TOURNAMENT_STAGE_ORDER = { qualifying: 0, seeding: 1, bracket: 2, shootout
 // unexpected schedule shape can't turn one tool call into a request storm.
 const TOURNAMENT_POOL_SCAN_CAP = 16;
 
-function makeTournamentStatusTool({ client, server, sleep }) {
+// Bind the caller's session for a match that is coming (queued, or adopted
+// from a push or a server read): the coordinator binding (readable from any
+// instance), the expectation flag that keeps get_turn on no_match until the
+// attach, the driver's wake target, and the receive path. Every path that
+// queues or adopts goes through here, so the bind contract lives in one
+// place. `rebind` moves the wake target to the caller even when another
+// session is bound; the queue tool always does, and so does an adoption
+// (nothing is live at that moment, and the session told "a match is
+// attached to this session" must be the one that gets the turns).
+function bindCallerForMatch(ctx, { coordinator, receiver, rebind }) {
+  const sessionKey = ctx?.sessionKey;
+  coordinator.bindSession(sessionKey, ctx?.agentId);
+  coordinator.clearSessionMatch(sessionKey); //  drop any finished-match binding
+  coordinator.expectMatch(sessionKey); //  #922: a match is coming, get_turn says no_match
+  if (sessionKey && (rebind || !DRIVER.boundSessionKey)) {
+    DRIVER.boundSessionKey = sessionKey;
+    DRIVER.boundAgentId = ctx?.agentId ?? DRIVER.boundAgentId;
+  }
+  if (DRIVER.matchGameId) DRIVER.gameId = DRIVER.matchGameId;
+  receiver?.ensureStarted?.();
+}
+
+// #922: the guidance lines the status tool adds about the match it attached
+// (mechanics only; who may enter is the server's `messaging`).
+const TOURNAMENT_ADOPTED_GUIDANCE =
+  'A match is now attached to this session. Call get_turn; it blocks until your turn.';
+const TOURNAMENT_ADOPTED_CASUAL_GUIDANCE =
+  'A casual match of yours was live on the server and is now attached to this session. Call get_turn; it blocks until your turn. A tournament match created while it is in progress is picked up when it ends.';
+const TOURNAMENT_NO_MATCH_GUIDANCE =
+  'No match is waiting for this session. Stop; the plugin wakes you when your tournament match is created. After a wake, call get_turn; after a gateway restart, call tournament_status again.';
+const TOURNAMENT_ATTACHED_GUIDANCE =
+  'A match is already attached to this session; play it with get_turn and take_turn. A tournament match created while it is in progress is picked up when it ends.';
+const TOURNAMENT_ATTACHED_PAUSED_GUIDANCE =
+  'A match is already attached to this session; play it with get_turn and take_turn. leave_queue is in effect, so the next match is not picked up until queue_match lifts the pause.';
+const TOURNAMENT_ATTACHED_ELSEWHERE_GUIDANCE =
+  'A match is attached to another session of this agent; its turns and wakes go there. Play it from that session, or call tournament_status again after it ends.';
+const TOURNAMENT_PAUSED_GUIDANCE =
+  'leave_queue is in effect, so no new match is picked up. Call queue_match to lift the pause; a tournament match that is waiting is then attached instead of queueing.';
+const TOURNAMENT_QUEUED_GUIDANCE =
+  'You are queued for a casual game; this call changed nothing. A tournament match that forms is picked up by the plugin as it arrives.';
+const TOURNAMENT_UNCHECKED_GUIDANCE =
+  'The check for a waiting match did not complete. Call tournament_status again to attach one.';
+
+function makeTournamentStatusTool({ client, server, sleep, coordinator, receiver, logger }) {
   const wait = sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+
+  // #922: attach the entered agent's pending tournament match to THIS session.
+  // Tournament matches are created by the server with no queue request, and
+  // the plugin can wake the model only through the OpenClaw session a tool
+  // call ran in; until now only queue_match recorded one, so a fresh process
+  // sent an entered agent to "queue". The decision table, in order:
+  //   in_match            -> leave the live match alone (casual or tournament);
+  //   paused (leave_queue) -> nothing: the pause's scope is "no new match";
+  //   queued, no match     -> nothing: a casual queue is open on the server
+  //                          and adopting over it would strand that entry (#828);
+  //   queued, match tracked (a push landed before any bind, the #663 C state)
+  //                        -> complete the adoption: the attach block joins
+  //                          on the next tick;
+  //   idle / terminal      -> read the agent's live match from the server
+  //                          (the same read the supervisor's post-terminal
+  //                          discovery uses, no game filter) and adopt it.
+  // Best effort throughout: a failed or rate-limited read answers
+  // `match: null` and never fails the status read. Repeated calls are no-ops.
+  // The match-found block (#856) and the #663 carryover are left for the
+  // agent's first get_turn, exactly as a WS or supervisor adoption leaves them.
+  // Bind the caller for the tracked match and attach it NOW when a full-mode
+  // owner exists (the WS handler's inline form), so "a match is attached to
+  // this session" is true when the result is read and get_turn never spends
+  // a tick on no_match. Without an owner (a non-full registration) the
+  // supervisor's attach block completes it, as queue_match's adoption does.
+  function completeAdoption(ctx, matchId, gameId, lane) {
+    bindCallerForMatch(ctx, { coordinator, receiver, rebind: true });
+    const owner = getOwnerCoordinator();
+    if (owner && DRIVER.matchId === matchId && DRIVER.phase === 'queued') {
+      owner.attachMatch(ctx.sessionKey, matchId, DRIVER.matchGameId ?? gameId ?? undefined);
+      DRIVER.phase = 'in_match';
+      receiver?.openGame?.(matchId);
+    }
+    logger?.info?.(`[steamedclaw-plugin] tournament_status attached matchId=${matchId}`);
+    return {
+      match: {
+        matchId,
+        gameId: gameId ?? null,
+        ...(lane !== undefined ? { lane: lane ?? null } : {}),
+        status: 'adopted',
+      },
+      guidance:
+        lane && lane !== 'tournament'
+          ? TOURNAMENT_ADOPTED_CASUAL_GUIDANCE
+          : TOURNAMENT_ADOPTED_GUIDANCE,
+    };
+  }
+  // The live match, as it stands: attached to this session (with the pause
+  // caveat when leave_queue is in effect) or to another session of this
+  // agent, in which case the caller is told where its turns go.
+  function attachedResult(ctx) {
+    const here = !DRIVER.boundSessionKey || DRIVER.boundSessionKey === ctx?.sessionKey;
+    return {
+      match: {
+        matchId: DRIVER.matchId,
+        gameId: DRIVER.matchGameId ?? DRIVER.gameId ?? null,
+        status: 'attached',
+        boundToThisSession: here,
+      },
+      guidance: !here
+        ? TOURNAMENT_ATTACHED_ELSEWHERE_GUIDANCE
+        : DRIVER.paused
+          ? TOURNAMENT_ATTACHED_PAUSED_GUIDANCE
+          : TOURNAMENT_ATTACHED_GUIDANCE,
+    };
+  }
+  function noMatchWaiting(ctx) {
+    DRIVER.boundSessionKey = ctx.sessionKey;
+    DRIVER.boundAgentId = ctx.agentId ?? DRIVER.boundAgentId;
+    return { match: null, guidance: TOURNAMENT_NO_MATCH_GUIDANCE };
+  }
+  async function adoptPendingTournamentMatch(ctx, creds, readWithRetry) {
+    const sessionKey = ctx?.sessionKey;
+    if (DRIVER.phase === 'in_match' && DRIVER.matchId) return attachedResult(ctx);
+    if (!sessionKey || !coordinator) return { match: null };
+    // A push that landed before any bind (the #663 C state) would be attached
+    // by the supervisor's next tick regardless of a pause, so complete it and
+    // say so; the pause check below applies only to a match not yet tracked.
+    if (DRIVER.matchId && DRIVER.phase === 'queued') {
+      return completeAdoption(ctx, DRIVER.matchId, DRIVER.matchGameId);
+    }
+    if (DRIVER.paused) return { match: null, guidance: TOURNAMENT_PAUSED_GUIDANCE };
+    if (DRIVER.phase === 'queued' && !DRIVER.matchId) {
+      return { match: null, guidance: TOURNAMENT_QUEUED_GUIDANCE };
+    }
+    // The read is not gated on an open round: a match created inside the
+    // round window can still be live after the window closes, and an agent
+    // restarting then must still find it.
+    if (typeof client.activeMatch !== 'function') return { match: null };
+    let am = null;
+    try {
+      am = await readWithRetry(() => client.activeMatch(creds.agentId));
+    } catch (err) {
+      logger?.warn?.(`[steamedclaw-plugin] live-match read failed: ${err?.message ?? err}`);
+    }
+    if (!am?.ok) return { match: null, guidance: TOURNAMENT_UNCHECKED_GUIDANCE };
+    // Re-check after the await: a WS push may have adopted (or attached) first.
+    if (DRIVER.phase === 'in_match' && DRIVER.matchId) return attachedResult(ctx);
+    if (!am.matchId) return noMatchWaiting(ctx);
+    if (DRIVER.matchId === am.matchId) {
+      // Still tracked as queued: a WS adoption won the race; complete it.
+      // Terminal: the server list still shows the match that just ended;
+      // never re-adopt it (the supervisor's post-terminal discovery skips it
+      // the same way).
+      return DRIVER.phase === 'queued'
+        ? completeAdoption(ctx, DRIVER.matchId, DRIVER.matchGameId)
+        : noMatchWaiting(ctx);
+    }
+    adoptMatch(am.matchId, am.gameId ?? null);
+    await fetchMatchFoundViaStatus(client, am.matchId, am.gameId ?? null, logger);
+    return completeAdoption(ctx, am.matchId, am.gameId ?? null, am.lane);
+  }
 
   function readFailure(res) {
     if (res.httpStatus === 429) {
@@ -1125,11 +1282,23 @@ function makeTournamentStatusTool({ client, server, sleep }) {
     return { ok: false, error: 'tournament_lookup_failed', httpStatus: res.httpStatus };
   }
 
-  return () => ({
+  return (ctx) => ({
     name: 'tournament_status',
-    description: `Check SteamedClaw tournament status. Read-only: this tool does NOT enter or withdraw you from a tournament and does not play matches. No parameters; example call: tournament_status(). Returns {ok, state, tournament?, messaging?, ...} where state is one of: "none_active" (no tournament running); "not_registered" (a tournament exists, summary included, but you have no SteamedClaw registration); "not_entered" (tournament summary plus enterUrl, the portal entry page for this tournament); "entered" (your entry plus round (stage, roundNumber, window times), series (your matchup this round, normally exactly one: seriesId, opponent id and name, bestOfN, matchIds, outcome; empty in table formats; rounds run one at a time, so you play one match at a time) and standing (your rank row)); "withdrawn" (you were entered but withdrew). When the server sends messaging, messaging.toAgent is written for you and says how entry works for this tournament in your situation, and messaging.forOperator is written for your operator: relay it to them as is. The server decides eligibility and its messaging says what applies. Tournament matches arrive as normal match_found pushes (play them via get_turn and take_turn as usual) once you have called queue_match at least once since this plugin started, because that call binds your session. If you are entered and get_turn returns not_joined after the round window opens, call queue_match for the tournament game: the pending tournament match is adopted instead of queueing. On error "rate_limited", wait a few seconds and call again.`,
+    description: `Check SteamedClaw tournament status. Read-only: this tool does NOT enter or withdraw you from a tournament and does not play matches. No parameters; example call: tournament_status(). Returns {ok, state, tournament?, messaging?, match?, guidance?, ...} where state is one of: "none_active" (no tournament running); "not_registered" (a tournament exists, summary included, but you have no SteamedClaw registration); "not_entered" (tournament summary plus enterUrl, the portal entry page for this tournament); "entered" (your entry plus round (stage, roundNumber, window times), series (your matchup this round, normally exactly one: seriesId, opponent id and name, bestOfN, matchIds, outcome; empty in table formats; rounds run one at a time, so you play one match at a time) and standing (your rank row)); "withdrawn" (you were entered but withdrew). When the server sends messaging, messaging.toAgent is written for you and says how entry works for this tournament in your situation, and messaging.forOperator is written for your operator: relay it to them as is. The server decides eligibility and its messaging says what applies. Calling this tool connects your session to the plugin, and if you are entered and your tournament match exists it is attached: the result carries match (matchId, gameId, status "adopted" or "attached", or null) and a guidance line: stop and wait for the wake when no match is waiting, otherwise what to do next; then call get_turn and take_turn as usual, and the plugin wakes you when a round opens or the next game of your series is created. A match already in progress is left alone. Repeated calls are safe. Rounds are assigned by the server; do not call queue_match for tournament play. On error "rate_limited", wait a few seconds and call again.`,
     parameters: { type: 'object', properties: {}, additionalProperties: false },
     async execute() {
+      // #922: record the session this call ran in. The coordinator binding is
+      // recorded for every caller; the driver's wake target is taken only when
+      // nothing is bound yet, so a read-only call never moves where wakes go
+      // mid-match. Inert without credentials: the supervisor gates on them.
+      const sessionKey = ctx?.sessionKey;
+      if (sessionKey && coordinator) {
+        coordinator.bindSession(sessionKey, ctx?.agentId);
+        if (!DRIVER.boundSessionKey) {
+          DRIVER.boundSessionKey = sessionKey;
+          DRIVER.boundAgentId = ctx?.agentId ?? null;
+        }
+      }
       // Bounded 429 handling (feedback_http_client_handle_429): ONE floored,
       // capped wait + ONE retry PER TOOL CALL — never a loop, and waits never
       // stack across the up-to-many sub-reads (a second 429 after the budget is
@@ -1149,7 +1318,13 @@ function makeTournamentStatusTool({ client, server, sleep }) {
 
       try {
         const creds = readCredentials();
-        if (creds) client.setApiKey(creds.apiKey);
+        if (creds) {
+          client.setApiKey(creds.apiKey);
+          // #922: "connect this session" includes the receive path, so a
+          // tournament push that arrives after this call can attach inline
+          // and wake this session. Idempotent, single-flight.
+          receiver?.ensureStarted?.();
+        }
 
         const active = await readWithRetry(() => client.tournamentActive());
         if (!active.ok) return toolText(readFailure(active));
@@ -1267,6 +1442,11 @@ function makeTournamentStatusTool({ client, server, sleep }) {
           };
         });
 
+        // #922: attach the pending tournament match to this session, if any.
+        // Last, after every read that can return rate_limited early, so an
+        // adoption is never performed and then dropped from the result.
+        const adoption = await adoptPendingTournamentMatch(ctx, creds, readWithRetry);
+
         return toolText({
           ok: true,
           state: 'entered',
@@ -1276,6 +1456,7 @@ function makeTournamentStatusTool({ client, server, sleep }) {
           series,
           standing,
           ...messaging,
+          ...adoption,
         });
       } catch (err) {
         // A transport-level failure (timeout, connection refused) rejects the
@@ -1329,9 +1510,10 @@ export function registerPlugin(api, opts = {}) {
   api.registerTool(infoFactories[1], { name: 'get_rules' });
   api.registerTool(infoFactories[2], { name: 'get_strategy' });
   // opts.sleep lets tests observe the 429 backoff without real delays.
-  api.registerTool(makeTournamentStatusTool({ client, server, sleep: opts.sleep }), {
-    name: 'tournament_status',
-  });
+  api.registerTool(
+    makeTournamentStatusTool({ client, server, sleep: opts.sleep, coordinator, receiver, logger }),
+    { name: 'tournament_status' },
+  );
 
   // Supervisor service — full mode only.
   if (api.registrationMode === 'full') {

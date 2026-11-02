@@ -27,7 +27,7 @@
 import https from 'node:https';
 import http from 'node:http';
 
-export const PLUGIN_USER_AGENT = 'steamedclaw-plugin/1.0.11';
+export const PLUGIN_USER_AGENT = 'steamedclaw-plugin/1.0.12';
 export const TERMINAL_MATCH_STATUSES = new Set(['game_over']);
 
 export function httpRequest(method, urlStr, apiKey, body, userAgent = PLUGIN_USER_AGENT) {
@@ -196,7 +196,14 @@ export function makeClient({
           !x.finishedAt &&
           (x.status === 'active' || x.status === 'waiting' || x.status === 'not_started'),
       );
-      return { ok: true, matchId: m ? m.id : null, gameId: m ? (m.gameId ?? null) : null };
+      // `lane` (#922) tells an adopting caller whether the row is a tournament
+      // match; absent on older rows.
+      return {
+        ok: true,
+        matchId: m ? m.id : null,
+        gameId: m ? (m.gameId ?? null) : null,
+        lane: m ? (m.lane ?? null) : null,
+      };
     },
 
     async getState(matchId) {

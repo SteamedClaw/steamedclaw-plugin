@@ -1,10 +1,10 @@
 // Coordinator — module-scope match state + parked-turn token model (072j/072k).
 //
-// Folded from the live-validated coordinator POC (tools/steamedclaw-coordinator-
-// poc/coordinator.mjs). Owns the cross-component protocol state at MODULE scope
-// (so every register() instance of this resolved file shares one object — the
-// instance-split guarantee the WS receiver also relies on) and the v1 PULL
-// delivery contract: each turn is PARKED in module scope with a single-use
+// Folded from the live-validated 072 coordinator POC (072j/072k; the POC was
+// removed in 21032720 on 2026-11-01). Owns the cross-component protocol state
+// at MODULE scope (so every register() instance of this resolved file shares one
+// object — the instance-split guarantee the WS receiver also relies on) and the
+// v1 PULL delivery contract: each turn is PARKED in module scope with a single-use
 // token; the agent fetches it via the BLOCKING get_turn tool
 // and submits via take_turn (token-validated).
 //
@@ -477,8 +477,22 @@ function makeCoordinator(api) {
         agentId: agentId ?? existing?.agentId,
         gameId: existing?.gameId,
         matchId: existing?.matchId,
+        expectingMatch: existing?.expectingMatch === true,
       });
       return true;
+    },
+
+    // #922: a bound session is not always waiting for a match. queue_match
+    // binds AND queues (or adopts), so its binding expects a match and
+    // nextTurn answers no_match until one attaches; tournament_status binds in
+    // every state so a later push can be attached and the model woken, but a
+    // not-entered agent is waiting for nothing and must still hear not_joined
+    // (with its "queue or tournament_status" guidance) rather than "still
+    // matchmaking". Set by every path that queues or adopts; cleared with the
+    // match association. Not owner-gated (a plain module-scope write).
+    expectMatch(sessionKey) {
+      const b = SHARED.bindings.get(sessionKey);
+      if (b) b.expectingMatch = true;
     },
 
     // Clear a session's current match association (used by the queue tool when
@@ -487,7 +501,10 @@ function makeCoordinator(api) {
     // game instead of no_match. Not owner-gated (a plain module-scope write).
     clearSessionMatch(sessionKey) {
       const b = SHARED.bindings.get(sessionKey);
-      if (b) b.matchId = null;
+      if (b) {
+        b.matchId = null;
+        b.expectingMatch = false;
+      }
     },
 
     // Snapshot of current bindings (module scope, readable from any instance —
@@ -632,7 +649,9 @@ function makeCoordinator(api) {
       const binding = SHARED.bindings.get(sessionKey);
       if (!binding) return { status: 'not_joined' };
       const matchId = binding.matchId;
-      if (!matchId) return { status: 'no_match' };
+      // #922: bound but waiting for nothing (a tournament_status call from an
+      // agent that is not entered) is not_joined, not "still matchmaking".
+      if (!matchId) return { status: binding.expectingMatch ? 'no_match' : 'not_joined' };
       if (SHARED.terminalMatches.has(matchId)) {
         // Surface the outcome captured at terminal detection so an agent parked
         // in get_turn on the opponent-ended path learns win/loss + replay, not a
@@ -906,7 +925,7 @@ export function makeGetTurnFactory(coordinator, { nextTurnBlockMs } = {}) {
   const blockSecs = Math.round(blockMs / 1000);
   return (ctx) => ({
     name: 'get_turn',
-    description: `Fetch your current SteamedClaw turn. This call WAITS up to ~${blockSecs}s for your turn to arrive, then returns status: "not_joined" (you have not queued — call queue_match first), "no_match" (still matchmaking — call again), "waiting" (matched, opponent's turn — call again), "your_turn" (act now: pass the returned turnToken to take_turn), or "game_over" (the match ended — the result carries the server's end-of-game envelope verbatim, typically results, rating, newBadges, shareText, replayUrl and messaging plus whatever else the server sends; fields vary by transport; stop). A "your_turn" result may carry "turnEndsAt" — the ISO 8601 deadline for this turn: act before it or the turn is forfeited. The first result for a new match may carry "matchFound": the server's match-found details (gameName, opponentDetails with each opponent's name and, when rated, rating, watchUrl, a link your operator can watch the match at, and messaging.toAgent, a line written for you); it is delivered once, so note it. In discussion games (werewolf, murder-mystery) the result may also carry a "messages" array — the recent table talk; read it before acting (absent when nothing has been said). Just call it again whenever it returns no_match or waiting. ${PLAY_LOOP}`,
+    description: `Fetch your current SteamedClaw turn. This call WAITS up to ~${blockSecs}s for your turn to arrive, then returns status: "not_joined" (no match is attached to this session: call queue_match for a casual game, or tournament_status if you are entered in a tournament), "no_match" (still matchmaking — call again), "waiting" (matched, opponent's turn — call again), "your_turn" (act now: pass the returned turnToken to take_turn), or "game_over" (the match ended — the result carries the server's end-of-game envelope verbatim, typically results, rating, newBadges, shareText, replayUrl and messaging plus whatever else the server sends; fields vary by transport; stop). A "your_turn" result may carry "turnEndsAt" — the ISO 8601 deadline for this turn: act before it or the turn is forfeited. The first result for a new match may carry "matchFound": the server's match-found details (gameName, opponentDetails with each opponent's name and, when rated, rating, watchUrl, a link your operator can watch the match at, and messaging.toAgent, a line written for you); it is delivered once, so note it. In discussion games (werewolf, murder-mystery) the result may also carry a "messages" array — the recent table talk; read it before acting (absent when nothing has been said). Just call it again whenever it returns no_match or waiting. ${PLAY_LOOP}`,
     parameters: { type: 'object', properties: {}, additionalProperties: false },
     async execute() {
       const sessionKey = ctx?.sessionKey;
@@ -933,7 +952,8 @@ export function makeGetTurnFactory(coordinator, { nextTurnBlockMs } = {}) {
       // — the result text is the only place to pre-load what that wake means.
       // Mechanics live in tool results, never in agent SOUL/persona.
       if (r.status === 'not_joined') {
-        r.guidance = 'You have not queued yet. Call queue_match with a gameId first.';
+        r.guidance =
+          'No match is attached to this session. Call queue_match with a gameId for a casual game, or tournament_status if you are entered in a tournament.';
       } else if (r.status === 'waiting' || r.status === 'no_match') {
         r.guidance =
           'Either call get_turn again, or stop — a heartbeat will wake you when it is your turn. When you wake from a heartbeat, call get_turn FIRST.';
