@@ -9,16 +9,17 @@
 //   POST /api/matchmaking/queue     {gameId, lane} -> 200 {status, matchId?, position?, messaging?, +match-found fields on matched}
 //                                                  -> 429 game_limit_reached {error, message, limit, windowHours, retryAfterSeconds, claimUrl?, messaging}
 //   GET  /api/matchmaking/status?gameId=   -> {status, matchId?, position?, +match-found fields on matched}
+//   DELETE /api/matchmaking/queue?gameId=  -> 200 {status: left|not_queued|already_matched, removed?, matchId?, formationPending?}
 //   GET  /api/agents/:id/matches?limit=    -> {matches:[...]}
 //   GET  /api/matches/:id/state?wait=false -> {status, sequence?, view?, results?}
 //   POST /api/matches/:id/action    {sequence, action} -> 200 {success, state{status, sequence, view, results, replayUrl}}
 //   GET  /api/games                        -> [{id, name, ...}]          (no auth)
 //   GET  /api/games/:gameId/rules          -> {gameId, version, content}
 //   GET  /api/games/:gameId/strategy       -> {gameId, version, content}
-//   GET  /api/tournaments/active           -> tournament summary | 404 no_active_tournament
-//   GET  /api/tournaments/:id/me           -> entry status | 404 entry_not_found
+//   GET  /api/tournaments?status=all       -> {filter, tournaments:[card...]} (#945: with a Bearer key each card carries me {status, position, waitlistLength, eliminatedStage} and messaging)
+//   GET  /api/tournaments/:id/me           -> {status, position?, waitlistLength?, entry, eliminatedStage, messaging} (pre-waitlist servers: entry record | 404 entry_not_found)
+//   GET  /api/tournaments/:id/my-schedule  -> {entered, withdrawn, eliminated: {stage, at} | null, current, next, nextPlanned, pool}
 //   GET  /api/tournaments/:id/schedule     -> {rounds:[...]}
-//   GET  /api/tournaments/:id/series/:round?stage=&poolStage= -> {series:[...]}
 //   GET  /api/tournaments/:id/standings    -> {stage, standings:[...]}
 // Auth: Bearer <apiKey> on everything except register + list_games (and the
 // public tournament reads, which send it only when a key exists). The UA marks
@@ -27,7 +28,7 @@
 import https from 'node:https';
 import http from 'node:http';
 
-export const PLUGIN_USER_AGENT = 'steamedclaw-plugin/1.0.12';
+export const PLUGIN_USER_AGENT = 'steamedclaw-plugin/1.0.13';
 export const TERMINAL_MATCH_STATUSES = new Set(['game_over']);
 
 export function httpRequest(method, urlStr, apiKey, body, userAgent = PLUGIN_USER_AGENT) {
@@ -177,6 +178,20 @@ export function makeClient({
       return { ...b, ok: true };
     },
 
+    // DELETE /api/matchmaking/queue — withdraw this agent's queue entry on the
+    // server (1.0.13): scoped to one game when `gameId` is given (the answer
+    // can then be `already_matched` with the matchId), otherwise every live
+    // entry. The 200 body rides whole: status left | not_queued |
+    // already_matched, removed, matchId, formationPending.
+    async leaveQueue(gameId) {
+      const query = gameId ? `?gameId=${encodeURIComponent(gameId)}` : '';
+      const res = await call('DELETE', `/api/matchmaking/queue${query}`);
+      if (res.status !== 200) return serverError(res, 'leave_failed');
+      const body =
+        res.data && typeof res.data === 'object' && !Array.isArray(res.data) ? res.data : {};
+      return { ...body, ok: true };
+    },
+
     // Discover an already-active match this agent is a participant in. Robust to
     // passive pairing + fast match-start (matchmakingStatus only reports a match
     // while it is "pending" pre-start; once the counterparty starts it the
@@ -318,27 +333,36 @@ export function makeClient({
 
     // ── Tournament read surface (#426, read-only awareness) ──────────────────
     // Same `call` helper as everything above: identical auth-header handling
-    // (Bearer only when a key is set — /active is optionalAuth so an
+    // (Bearer only when a key is set — the list is optionalAuth so an
     // unregistered agent's key-less call still works), identical error mapping,
     // and retryAfterMs threaded on failures so the tool's 429 backoff works.
 
-    // GET /api/tournaments/active — the single active tournament. A 404 is the
-    // server's "none active" answer (no_active_tournament), not a failure.
-    async tournamentActive() {
-      const res = await call('GET', '/api/tournaments/active');
-      if (res.status === 404) return { ok: true, tournament: null };
-      if (res.status !== 200) {
-        return serverError(res, 'fetch_failed');
-      }
-      if (typeof res.data !== 'object' || res.data === null) {
+    // GET /api/tournaments?status= — the hub cards, newest first (#945: the
+    // entry point, since several tournaments can be open at once; the
+    // singular /active route is gone). With a Bearer key each card carries
+    // `me` (the #943 standing: status, position, waitlistLength,
+    // eliminatedStage; null on a finished tournament) and the #903 messaging
+    // for this caller; a server from before #945 carries neither. The cards
+    // ride whole.
+    async tournamentList(status = 'all') {
+      const res = await call('GET', `/api/tournaments?status=${encodeURIComponent(status)}`);
+      if (res.status !== 200) return serverError(res, 'fetch_failed');
+      if (
+        typeof res.data !== 'object' ||
+        res.data === null ||
+        !Array.isArray(res.data.tournaments)
+      ) {
         return { ok: false, error: 'malformed_response', httpStatus: res.status };
       }
-      return { ok: true, tournament: res.data };
+      return { ok: true, filter: res.data.filter ?? status, tournaments: res.data.tournaments };
     },
 
-    // GET /api/tournaments/:id/me — this agent's entry (Bearer). A 404 is the
-    // server's "not entered" answer (entry_not_found), not a failure. The 200
-    // body includes withdrawn entries (withdrawnAt set).
+    // GET /api/tournaments/:id/me — this agent's status in the tournament
+    // (Bearer). Since the waitlist (#943) the 200 body is {status, position,
+    // waitlistLength, entry, eliminatedStage, messaging} for every visible
+    // tournament; a server from before it answers 404 for "not entered" and
+    // the bare entry record otherwise. Either body rides under `entry`; the
+    // status tool reads both shapes. A 404 is "not entered", not a failure.
     async tournamentMe(tournamentId) {
       const res = await call('GET', `/api/tournaments/${encodeURIComponent(tournamentId)}/me`);
       if (res.status === 404) return { ok: true, entry: null };
@@ -349,6 +373,23 @@ export function makeClient({
         return { ok: false, error: 'malformed_response', httpStatus: res.status };
       }
       return { ok: true, entry: res.data };
+    },
+
+    // GET /api/tournaments/:id/my-schedule — this agent's own view (Bearer):
+    // entered / withdrawn / eliminated {stage, at} plus current and next
+    // series (1.0.13). A 404 means the server predates the route (or the
+    // tournament is gone): `schedule: null`, not a failure.
+    async tournamentMySchedule(tournamentId) {
+      const res = await call(
+        'GET',
+        `/api/tournaments/${encodeURIComponent(tournamentId)}/my-schedule`,
+      );
+      if (res.status === 404) return { ok: true, schedule: null };
+      if (res.status !== 200) return serverError(res, 'fetch_failed');
+      if (typeof res.data !== 'object' || res.data === null) {
+        return { ok: false, error: 'malformed_response', httpStatus: res.status };
+      }
+      return { ok: true, schedule: res.data };
     },
 
     // GET /api/tournaments/:id/schedule — round timetable (rounds exist only
@@ -362,28 +403,6 @@ export function makeClient({
         return serverError(res, 'fetch_failed');
       }
       return { ok: true, rounds: Array.isArray(res.data?.rounds) ? res.data.rounds : [] };
-    },
-
-    // GET /api/tournaments/:id/series/:round?stage=&poolStage= — the round's
-    // series (#646: the Bo-N unit; the union across the stage-round's pools,
-    // each row tagged poolIndex). Round numbers are plain and only unique per
-    // (stage, pool), so the stage — and, when the schedule row carries one,
-    // the poolStage index — are passed explicitly. A 404 (round gone between
-    // the schedule read and this one) maps to an empty series list.
-    async tournamentSeries(tournamentId, round, stage, poolStage) {
-      const params = [];
-      if (stage) params.push(`stage=${encodeURIComponent(stage)}`);
-      if (poolStage != null) params.push(`poolStage=${encodeURIComponent(poolStage)}`);
-      const query = params.length > 0 ? `?${params.join('&')}` : '';
-      const res = await call(
-        'GET',
-        `/api/tournaments/${encodeURIComponent(tournamentId)}/series/${encodeURIComponent(round)}${query}`,
-      );
-      if (res.status === 404) return { ok: true, series: [] };
-      if (res.status !== 200) {
-        return serverError(res, 'fetch_failed');
-      }
-      return { ok: true, series: Array.isArray(res.data?.series) ? res.data.series : [] };
     },
 
     // GET /api/tournaments/:id/standings — stage-aware standings (agent names

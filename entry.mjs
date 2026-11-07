@@ -348,7 +348,11 @@ async function fetchMatchFoundViaStatus(client, matchId, gameId, logger) {
 export function makeWsReceiver({ api, server, logger, makeWebSocket }) {
   function handleMatchFound(frame) {
     try {
-      if (DRIVER.paused) return; //  leave_queue: ignore NEW pairings
+      // leave_queue: ignore NEW pairings, unless the server may still hold
+      // this plugin's own queue entry (a withdraw not yet confirmed, a
+      // formation in flight): then the pairing is the agent's and is attached
+      // rather than orphaned (1.0.13).
+      if (DRIVER.paused && !(DRIVER.phase === 'queued' && !DRIVER.matchId)) return;
       if (!frame?.matchId) return;
       if (frame.matchId === DRIVER.matchId) return; //  duplicate push for the tracked match
       // Single-match v1: only a LIVE match occupies the slot. A terminal one
@@ -517,6 +521,13 @@ export async function supervisorTick({ client, server, cfg, logger, receiver, ap
     // Resolve the matchId for an outstanding queue entry. Primary discovery is
     // the /ws/agent match_found push (handled in makeWsReceiver); the HTTP polls
     // here run only when that socket is down, or on the safety cadence.
+    // 1.0.13: this block runs while paused too. leave_queue withdraws the
+    // server entry and moves the phase to idle on a confirmed withdraw, so a
+    // paused plugin reaches this block only while the server may still hold
+    // or be forming a pairing (an unconfirmed withdraw, a formation in
+    // flight). A match the server commits is the agent's and is attached
+    // rather than orphaned; a not_queued answer then settles to idle without
+    // the re-queue wake, since the agent asked to leave.
     if (!DRIVER.matchId && DRIVER.phase === 'queued') {
       // No client-side queue timeout. Queued is queued — the server owns the TTL
       // (standard 65 min / fast 20 min, see lane-timeouts.ts) and is the single
@@ -543,6 +554,11 @@ export async function supervisorTick({ client, server, cfg, logger, receiver, ap
           if (s.ok && s.status === 'matched' && s.matchId) {
             DRIVER.matchId = s.matchId;
             storeMatchFound(s.matchId, matchFoundBlock(s)); //  #856: who you are playing, once
+          } else if (s.ok && s.status === 'not_queued' && DRIVER.paused) {
+            // The agent asked to leave and the server holds nothing: settle
+            // without the re-queue wake below.
+            logger.info?.('[steamedclaw-plugin] no longer queued after leave_queue');
+            DRIVER.phase = 'idle';
           } else if (s.ok && s.status === 'not_queued') {
             // Server dropped/consumed our entry without a match (a rare ~65-min
             // event at the server TTL). This is the ONE legitimate re-queue
@@ -1027,16 +1043,146 @@ function makeQueueTool({ client, server, cfg, logger, receiver, coordinator }) {
   });
 }
 
-function makeLeaveQueueTool() {
-  return () => ({
+// 1.0.13: leave_queue withdraws the agent's queue entry on the server as well
+// as pausing the plugin. The pause alone left the server entry open, so the
+// matchmaker could still pair the agent and the HTTP floor attached the match
+// (reproduced by the registry's audit of 1.0.12). The server's answer rides
+// whole under `queue`; a match that had already formed is recorded here the
+// way the queued-phase discovery records one, and the supervisor attaches it.
+const LEAVE_WITHDRAWN_GUIDANCE =
+  'No queue entry is open for you on the server and no new match is picked up by this plugin. Call queue_match to play again.';
+const LEAVE_ALREADY_MATCHED_GUIDANCE =
+  'A match had already formed before the withdraw reached the server. It is attached and plays out: call get_turn. No new match is picked up after it until queue_match.';
+const LEAVE_UNCONFIRMED_TAIL =
+  'No new match is picked up by this plugin meanwhile; a match the server forms is still attached and played, since it is yours.';
+const LEAVE_FORMING_GUIDANCE =
+  'Your queue entry is withdrawn, but the server was forming a pairing as the withdraw landed. If that match completes it is attached and a heartbeat wakes you: call get_turn then. Otherwise nothing is queued and no new match is picked up until queue_match.';
+const LEAVE_LOCAL_GUIDANCE =
+  'Nothing was sent to the server (this plugin holds no registration). No new match is picked up by this plugin until queue_match.';
+const LEAVE_NOTHING_QUEUED_GUIDANCE =
+  'Nothing was queued. Your current match plays out with get_turn and take_turn; no new match is picked up after it until queue_match.';
+const LEAVE_UNCONFIRMED_GUIDANCE =
+  'The server did not confirm the withdraw, so your queue entry may still be open there. Call leave_queue again. ' +
+  LEAVE_UNCONFIRMED_TAIL;
+
+function makeLeaveQueueTool({ client, coordinator, logger }) {
+  return (ctx) => ({
     name: 'leave_queue',
     description:
-      'Pause SteamedClaw matchmaking. After this call the plugin stops picking up NEW match_found pairings — an already-active match still plays out to game_over normally. The pause is in-memory only (a container restart resets to accepting). Resume by calling queue_match again — that clears the pause. Returns {ok:true, status:"queue_paused"} (or "already_paused").',
+      'Stop SteamedClaw matchmaking. Withdraws your queue entry on the server (the game you queued for, or every entry when this plugin tracks none) and pauses pickups of new pairings in this plugin; an active match plays out to game_over normally. If a match had already formed, the result says so and that match is attached: call get_turn. Returns {ok, status:"queue_paused"|"already_paused", queue, guidance}: ok:true with queue the server\'s answer ({status:"left"|"not_queued"|"already_matched", removed?, matchId?}) or null when nothing could be sent; ok:false with error "leave_failed" when the server did not confirm the withdraw (the pause is in effect; call leave_queue again, after retryAfterMs when it is given). The pause itself is in-memory (a gateway restart resets to accepting). Resume by calling queue_match, which clears the pause. Example: leave_queue().',
     parameters: { type: 'object', properties: {}, additionalProperties: false },
     async execute() {
-      if (DRIVER.paused) return toolText({ ok: true, status: 'already_paused' });
-      DRIVER.paused = true;
-      return toolText({ ok: true, status: 'queue_paused' });
+      const status = DRIVER.paused ? 'already_paused' : 'queue_paused';
+      DRIVER.paused = true; //  first, so a push landing during the withdraw is not picked up
+      const wasQueued = DRIVER.phase === 'queued' && !DRIVER.matchId;
+      // A match in play, or one tracked and about to attach; the terminal
+      // phase keeps the ended match's id and holds nothing.
+      const holdsMatch =
+        DRIVER.phase === 'in_match' || (DRIVER.phase === 'queued' && Boolean(DRIVER.matchId));
+      const creds = readCredentials();
+      if (!creds?.apiKey || typeof client.leaveQueue !== 'function') {
+        return toolText({ ok: true, status, queue: null, guidance: LEAVE_LOCAL_GUIDANCE });
+      }
+      client.setApiKey(creds.apiKey);
+      const scopedGame = wasQueued ? (DRIVER.gameId ?? undefined) : undefined;
+      let queue;
+      try {
+        queue = await client.leaveQueue(scopedGame);
+      } catch (err) {
+        queue = { ok: false, error: 'leave_failed', message: String(err?.message ?? err) };
+      }
+      if (!queue?.ok) {
+        // The entry may still be open on the server: a top-level failure, as
+        // queue_match reports a failed queue call, with the pause noted. The
+        // phase stays queued so the supervisor's discovery (and a push) keeps
+        // watching: a pairing that forms is attached rather than orphaned,
+        // and not_queued settles to idle.
+        rateLimited(queue, logger);
+        logger?.warn?.(`[steamedclaw-plugin] leave_queue: server withdraw failed: ${queue?.error}`);
+        const guidance =
+          queue?.httpStatus === 429
+            ? `Wait retryAfterMs (${Math.ceil((queue.retryAfterMs ?? DEFAULT_RATE_LIMIT_BACKOFF_MS) / 1000)}s) before calling leave_queue again. ${LEAVE_UNCONFIRMED_TAIL}`
+            : LEAVE_UNCONFIRMED_GUIDANCE;
+        return toolText({
+          ok: false,
+          error: 'leave_failed',
+          ...(queue?.retryAfterMs !== undefined ? { retryAfterMs: queue.retryAfterMs } : {}),
+          status,
+          queue,
+          guidance,
+        });
+      }
+      // `left` proves no formation involves the entry (the server pulls a
+      // reserved entry out of the live queue before counting). After a scoped
+      // `not_queued`, GET /status is the server's source of truth for a match
+      // that committed in the formation window: one read tells whether a
+      // pairing beat the withdraw. A failed read leaves the phase queued; the
+      // supervisor's discovery settles it.
+      let matchId = queue.status === 'already_matched' ? (queue.matchId ?? null) : null;
+      let statusRead = true;
+      if (
+        !matchId &&
+        wasQueued &&
+        scopedGame &&
+        queue.status === 'not_queued' &&
+        typeof client.matchmakingStatus === 'function'
+      ) {
+        let s = null;
+        try {
+          s = await client.matchmakingStatus(scopedGame);
+        } catch (err) {
+          logger?.warn?.(
+            `[steamedclaw-plugin] leave_queue: status read failed: ${err?.message ?? err}`,
+          );
+        }
+        if (rateLimited(s, logger) || !s?.ok) {
+          statusRead = false;
+        } else if (s.status === 'matched' && s.matchId) {
+          matchId = s.matchId;
+          storeMatchFound(s.matchId, matchFoundBlock(s));
+        }
+      }
+      if (matchId) {
+        // Only a scoped withdraw (nothing tracked) can answer this; the match
+        // is recorded as the queued-phase discovery records one.
+        DRIVER.matchId = matchId;
+        if (queue.status === 'already_matched') {
+          await fetchMatchFoundViaStatus(client, matchId, DRIVER.gameId ?? null, logger);
+        }
+        return toolText({
+          ok: true,
+          status,
+          queue,
+          matchId,
+          guidance: LEAVE_ALREADY_MATCHED_GUIDANCE,
+        });
+      }
+      if (!wasQueued) {
+        return toolText({
+          ok: true,
+          status,
+          queue,
+          ...(holdsMatch ? { matchId: DRIVER.matchId } : {}),
+          guidance: holdsMatch ? LEAVE_NOTHING_QUEUED_GUIDANCE : LEAVE_WITHDRAWN_GUIDANCE,
+        });
+      }
+      if (queue.formationPending === true || !statusRead) {
+        // The server was forming a pairing when the withdraw landed (or the
+        // status read did not complete): the phase stays queued so the
+        // supervisor's discovery attaches the match if it commits, or settles
+        // to idle without a re-queue wake if it does not.
+        return toolText({ ok: true, status, queue, guidance: LEAVE_FORMING_GUIDANCE });
+      }
+      // The queue entry is gone: the plugin tracks nothing, and the sessions
+      // that waited for a match wait for nothing (get_turn answers not_joined,
+      // not "still matchmaking"): the caller's and the one that queued.
+      DRIVER.phase = 'idle';
+      if (coordinator) {
+        for (const key of new Set([ctx?.sessionKey, DRIVER.boundSessionKey])) {
+          if (key) coordinator.clearSessionMatch(key);
+        }
+      }
+      return toolText({ ok: true, status, queue, guidance: LEAVE_WITHDRAWN_GUIDANCE });
     },
   });
 }
@@ -1097,19 +1243,21 @@ function makeInfoTools({ client }) {
 
 // ── tournament_status (#426): read-only tournament awareness ─────────────────
 // Entry is deliberately NOT exposed: registration is an owner act on the portal
-// (planning/063 §9.3 re-scope, 2026-08-05). The tool only reads. The entered
-// view is assembled from the public reads (/schedule, /series, /standings)
-// because /me carries entry fields only; every server shape passes through
-// verbatim. Unregistered agents still get discovery — /active is public.
+// (planning/063 §9.3 re-scope, 2026-08-05). The tool only reads. The list
+// (#945) is the entry point and carries the agent's standing per card; the
+// entered view adds the agent's own schedule (/my-schedule) and the
+// standings. Every server shape passes through verbatim. Unregistered agents
+// still get discovery: the list is public.
 
-// Mirrors the server's LIVE_STAGE_ORDER: when rounds of several stages are
-// open, the later stage is the one the agent is playing in.
-const TOURNAMENT_STAGE_ORDER = { qualifying: 0, seeding: 1, bracket: 2, shootout: 3 };
-// #646: rounds within a pool run sequentially and the schedule aggregates to
-// one row per stage-round, so normally exactly ONE open row exists and the
-// agent has at most ONE series in it. The scan cap stays as a guard so an
-// unexpected schedule shape can't turn one tool call into a request storm.
-const TOURNAMENT_POOL_SCAN_CAP = 16;
+// A card in one of these statuses is over for everyone; the list is read
+// for the rest (#945).
+const TOURNAMENT_FINISHED_STATUSES = new Set(['completed', 'cancelled']);
+// At most this many unfinished tournaments are reported per call (newest
+// first), so one tool call cannot fan out into a request storm; the result
+// says when more existed.
+const TOURNAMENT_LIST_READ_CAP = 8;
+// Before play starts there are no standings to read.
+const TOURNAMENT_PRE_PLAY_STATUSES = new Set(['announced', 'registration']);
 
 // Bind the caller's session for a match that is coming (queued, or adopted
 // from a push or a server read): the coordinator binding (readable from any
@@ -1151,8 +1299,49 @@ const TOURNAMENT_PAUSED_GUIDANCE =
   'leave_queue is in effect, so no new match is picked up. Call queue_match to lift the pause; a tournament match that is waiting is then attached instead of queueing.';
 const TOURNAMENT_QUEUED_GUIDANCE =
   'You are queued for a casual game; this call changed nothing. A tournament match that forms is picked up by the plugin as it arrives.';
+const TOURNAMENT_ELIMINATED_GUIDANCE =
+  'You are out of this tournament; it creates no further match for you.';
+const TOURNAMENT_WAITLISTED_GUIDANCE =
+  'You hold a waiting place in this tournament, not a seat. tournament_status shows your place; when you hold a seat the status reads entered.';
+const TOURNAMENT_CLOSED_OUT_GUIDANCE =
+  'The waitlist closed without a seat for you; this tournament creates no match for you.';
 const TOURNAMENT_UNCHECKED_GUIDANCE =
   'The check for a waiting match did not complete. Call tournament_status again to attach one.';
+
+// The agent's status in a tournament, from the /me body. Since the waitlist
+// the server answers 200 for every visible tournament with {status, position,
+// waitlistLength, entry, eliminatedStage, messaging}; a server from before it
+// answered 404 for "not entered" (the transport maps that to null) and the
+// bare entry record otherwise. Both shapes read into one status.
+function entryStatusOf(body) {
+  const none = {
+    status: 'not_entered',
+    entry: null,
+    position: null,
+    waitlistLength: null,
+    eliminatedStage: null,
+    messaging: null,
+  };
+  if (!body || typeof body !== 'object') return none;
+  if (typeof body.status === 'string') {
+    return {
+      status: body.status,
+      entry: body.entry && typeof body.entry === 'object' ? body.entry : null,
+      position: body.position ?? null,
+      waitlistLength: body.waitlistLength ?? null,
+      eliminatedStage: body.eliminatedStage ?? null,
+      messaging: body.messaging && typeof body.messaging === 'object' ? body.messaging : null,
+    };
+  }
+  if (body.entryId) {
+    return {
+      ...none,
+      status: body.withdrawnAt != null ? 'withdrawn' : 'entered',
+      entry: body,
+    };
+  }
+  return none;
+}
 
 function makeTournamentStatusTool({ client, server, sleep, coordinator, receiver, logger }) {
   const wait = sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
@@ -1284,7 +1473,7 @@ function makeTournamentStatusTool({ client, server, sleep, coordinator, receiver
 
   return (ctx) => ({
     name: 'tournament_status',
-    description: `Check SteamedClaw tournament status. Read-only: this tool does NOT enter or withdraw you from a tournament and does not play matches. No parameters; example call: tournament_status(). Returns {ok, state, tournament?, messaging?, match?, guidance?, ...} where state is one of: "none_active" (no tournament running); "not_registered" (a tournament exists, summary included, but you have no SteamedClaw registration); "not_entered" (tournament summary plus enterUrl, the portal entry page for this tournament); "entered" (your entry plus round (stage, roundNumber, window times), series (your matchup this round, normally exactly one: seriesId, opponent id and name, bestOfN, matchIds, outcome; empty in table formats; rounds run one at a time, so you play one match at a time) and standing (your rank row)); "withdrawn" (you were entered but withdrew). When the server sends messaging, messaging.toAgent is written for you and says how entry works for this tournament in your situation, and messaging.forOperator is written for your operator: relay it to them as is. The server decides eligibility and its messaging says what applies. Calling this tool connects your session to the plugin, and if you are entered and your tournament match exists it is attached: the result carries match (matchId, gameId, status "adopted" or "attached", or null) and a guidance line: stop and wait for the wake when no match is waiting, otherwise what to do next; then call get_turn and take_turn as usual, and the plugin wakes you when a round opens or the next game of your series is created. A match already in progress is left alone. Repeated calls are safe. Rounds are assigned by the server; do not call queue_match for tournament play. On error "rate_limited", wait a few seconds and call again.`,
+    description: `Check SteamedClaw tournament status. Read-only: this tool does NOT enter or withdraw you from a tournament and does not play matches. No parameters; example call: tournament_status(). Reads every tournament that is not finished and your status in each. The result is the list under tournaments, in the server's order (newest first), one item per tournament: tournament (the card), state, messaging, and the fields for that state; the newest eight when more are unfinished, with listTruncated true and unfinishedCount. Nothing is summarized at the top: read each item. You may hold places in several tournaments at once (the server enforces its cap). A top-level state appears only for "none_active" (no unfinished tournament; the list is empty) or "not_registered" (you have no SteamedClaw registration; the list follows with the server's general messaging per tournament). An item's state is one of: "not_entered" (plus enterUrl, the portal entry page); "waitlisted" (you hold a waiting place: position and waitlistLength; this tournament attaches nothing); "entered" (entry (the record when /me was the source, null when the list card was), round (the open round holding your series: stage, roundNumber, window times; null when none is open for you), series (your series in that round, read from your own schedule: seriesId, opponent id and name, bestOfN, matchIds, outcome, bye, game wins; empty when none), next (your series in the next scheduled round, when drawn), nextPlanned, pool, and standing (your rank row)); "withdrawn"; "forfeited" (withdrawn after a forfeit); "eliminated" (a knockout stamped on your entry: eliminated {stage, at}; this tournament attaches nothing); "closed_out" (the waitlist closed without a seat for you). When the server sends messaging, messaging.toAgent is written for you and says how entry works for that tournament in your situation, and messaging.forOperator is written for your operator: relay it to them as is. The server decides eligibility and its messaging says what applies. Calling this tool connects your session to the plugin, and if you are entered anywhere and your tournament match exists it is attached: the result carries, at the top level, match (matchId, gameId, status "adopted" or "attached", or null) and a guidance line: stop and wait for the wake when no match is waiting, otherwise what to do next; then call get_turn and take_turn as usual, and the plugin wakes you when a round opens or the next game of your series is created. A match already in progress is left alone. Repeated calls are safe. Rounds are assigned by the server; do not call queue_match for tournament play. On error "rate_limited", wait a few seconds and call again.`,
     parameters: { type: 'object', properties: {}, additionalProperties: false },
     async execute() {
       // #922: record the session this call ran in. The coordinator binding is
@@ -1326,136 +1515,222 @@ function makeTournamentStatusTool({ client, server, sleep, coordinator, receiver
           receiver?.ensureStarted?.();
         }
 
-        const active = await readWithRetry(() => client.tournamentActive());
-        if (!active.ok) return toolText(readFailure(active));
-        if (!active.tournament) {
+        // #945: the list is the entry point (several tournaments can be open at
+        // once). Each card carries the caller's own standing (`me`, the #943
+        // status) and the #903 messaging written for this caller, so the
+        // agent's status needs no per-tournament read; a server from before
+        // #945 carries neither, and its /me (either shape) is read per
+        // unfinished tournament instead.
+        const list = await readWithRetry(() => client.tournamentList('all'));
+        if (!list.ok) return toolText(readFailure(list));
+        const allUnfinished = (Array.isArray(list.tournaments) ? list.tournaments : []).filter(
+          (c) => c && typeof c === 'object' && !TOURNAMENT_FINISHED_STATUSES.has(c.status),
+        );
+        const unfinished = allUnfinished.slice(0, TOURNAMENT_LIST_READ_CAP);
+        const truncation =
+          allUnfinished.length > unfinished.length
+            ? { listTruncated: true, unfinishedCount: allUnfinished.length }
+            : {};
+        if (unfinished.length === 0) {
           return toolText({
             ok: true,
             state: 'none_active',
+            tournaments: [],
             message: 'No SteamedClaw tournament is currently active or announced.',
           });
         }
-        const t = active.tournament;
-        // #903: the server writes the sentence about how entry works for this
-        // caller (`messaging.toAgent` for the agent, `messaging.forOperator`
-        // for their human) on the tournament summary. It is lifted to the top
-        // of every result, verbatim, the way lifecycle messaging is elsewhere;
-        // the summary itself still rides whole under `tournament`. The plugin
-        // no longer authors a `note` about who may enter: that rule is the
-        // server's, and a client copy of it went stale when the rule moved.
-        const messaging =
-          t?.messaging && typeof t.messaging === 'object' ? { messaging: t.messaging } : {};
-
+        const cardMessaging = (c) =>
+          c?.messaging && typeof c.messaging === 'object' ? { messaging: c.messaging } : {};
         if (!creds) {
-          return toolText({ ok: true, state: 'not_registered', tournament: t, ...messaging });
-        }
-
-        const me = await readWithRetry(() => client.tournamentMe(t.id));
-        if (!me.ok) return toolText(readFailure(me));
-        if (!me.entry) {
           return toolText({
             ok: true,
-            state: 'not_entered',
-            tournament: t,
-            enterUrl: `${server}/tournaments/${t.number}/enter`,
-            ...messaging,
-          });
-        }
-        if (me.entry.withdrawnAt != null) {
-          // Withdrawn entries ride the same /me response; round/opponent lookups
-          // would mislead (the agent no longer plays), so report and stop.
-          return toolText({
-            ok: true,
-            state: 'withdrawn',
-            tournament: t,
-            entry: me.entry,
-            ...messaging,
+            state: 'not_registered',
+            tournaments: unfinished.map((c) => ({
+              tournament: c,
+              state: 'not_registered',
+              ...cardMessaging(c),
+            })),
+            ...truncation,
           });
         }
 
-        // Entered: best-effort assembly — a failed sub-read nulls its field
-        // rather than failing the whole status (429s still surface, above).
-        //
-        // Round attribution (#646): rounds run sequentially and the schedule
-        // aggregates to one row per stage-round, so the latest open stage
-        // normally has exactly ONE open row — it IS the agent's round. The
-        // /series read returns the union across the stage-round's pools;
-        // filtering by our own agent id finds the agent's series (at most one
-        // per round; none in a bye round of an odd pool). The capped loop
-        // stays as a guard against an unexpected multi-open-row shape.
-        let round = null;
-        let mySeriesRows = null;
-        const sched = await readWithRetry(() => client.tournamentSchedule(t.id));
-        if (!sched.ok && sched.httpStatus === 429) return toolText(readFailure(sched));
-        if (sched.ok) {
-          const open = sched.rounds.filter((r) => r?.status === 'open');
-          if (open.length > 0) {
-            const topStage = open.reduce((best, r) =>
-              (TOURNAMENT_STAGE_ORDER[r.stage] ?? -1) > (TOURNAMENT_STAGE_ORDER[best.stage] ?? -1)
-                ? r
-                : best,
-            ).stage;
-            const candidates = open
-              .filter((r) => r.stage === topStage)
-              .sort((a, b) => a.roundNumber - b.roundNumber)
-              .slice(0, TOURNAMENT_POOL_SCAN_CAP);
-            if (candidates.length === 1) {
-              // Exactly one open round: the agent's round even when its series
-              // list is empty (table formats put seats in tables, not series;
-              // an odd pool's bye round leaves the agent without a series).
-              round = candidates[0];
-            }
-            for (const r of candidates) {
-              const pr = await readWithRetry(() =>
-                client.tournamentSeries(t.id, r.roundNumber, r.stage, r.poolStage),
-              );
-              if (!pr.ok && pr.httpStatus === 429) return toolText(readFailure(pr));
-              if (!pr.ok) break; //  best-effort: stop the scan on a hard failure
-              const mine = pr.series.filter(
-                (p) => p?.agentAId === creds.agentId || p?.agentBId === creds.agentId,
-              );
-              if (mine.length > 0) {
-                round = r;
-                mySeriesRows = mine;
-                break;
-              }
-            }
-          }
-        }
-
-        const stand = await readWithRetry(() => client.tournamentStandings(t.id));
-        if (!stand.ok && stand.httpStatus === 429) return toolText(readFailure(stand));
-        const rows = stand.ok ? stand.standings : [];
-        const standing = rows.find((row) => row?.agentId === creds.agentId) ?? null;
-
-        const series = (mySeriesRows ?? []).map((p) => {
-          const opponentAgentId = p.agentAId === creds.agentId ? p.agentBId : p.agentAId;
-          return {
-            seriesId: p.seriesId,
-            opponentAgentId,
-            // Display name resolved from the standings rows (the series
-            // payload carries ids only); null when the opponent has no row.
-            opponentName: rows.find((row) => row?.agentId === opponentAgentId)?.agentName ?? null,
-            bestOfN: p.bestOfN,
-            matchIds: p.matchIds,
-            outcome: p.outcome,
-          };
+        // The agent's own schedule (#927, #943): elimination stamp and its
+        // current and next series. A 404 (a server without the route) reads
+        // as null; a failed read degrades to null.
+        const readMySchedule = async (id) =>
+          typeof client.tournamentMySchedule === 'function'
+            ? readWithRetry(() => client.tournamentMySchedule(id))
+            : { ok: true, schedule: null };
+        const eliminatedItem = (item, st, eliminated) => ({
+          ...item,
+          state: 'eliminated',
+          entry: st.entry,
+          eliminated,
+          guidance: TOURNAMENT_ELIMINATED_GUIDANCE,
         });
 
+        // One tournament's item: its card, the agent's state in it and, for an
+        // entered agent, its round, series and standing. A rate-limited read
+        // answers `{ failure }` so the whole call surfaces rate_limited, as
+        // the single-tournament reads did.
+        const statusItem = async (t) => {
+          let st;
+          if (t.me && typeof t.me === 'object' && typeof t.me.status === 'string') {
+            st = entryStatusOf(t.me); //  the card's standing is the /me status shape minus the record
+          } else {
+            const me = await readWithRetry(() => client.tournamentMe(t.id));
+            if (!me.ok) return { failure: readFailure(me) };
+            st = entryStatusOf(me.entry);
+          }
+          // #943: a messaging block written for the agent's status (on /me)
+          // beats the card's line for this caller, which beats nothing.
+          const messaging = st.messaging ? { messaging: st.messaging } : cardMessaging(t);
+          const item = { tournament: t, state: st.status, ...messaging };
+          switch (st.status) {
+            case 'not_entered':
+              return { ...item, enterUrl: `${server}/tournaments/${t.number}/enter` };
+            case 'waitlisted':
+              // A waiting place, no entry: nothing to attach and no round
+              // lookups (a waiting agent has no series).
+              return {
+                ...item,
+                entry: null,
+                position: st.position,
+                waitlistLength: st.waitlistLength,
+                guidance: TOURNAMENT_WAITLISTED_GUIDANCE,
+              };
+            case 'eliminated': {
+              // Stamped by a pool cut or a bracket loss (#923): /me carries
+              // the stage, the own schedule the stamp with its time. Report
+              // and stop: no match is coming.
+              const mine = await readMySchedule(t.id);
+              if (!mine.ok && mine.httpStatus === 429) return { failure: readFailure(mine) };
+              return eliminatedItem(
+                item,
+                st,
+                mine.ok && mine.schedule?.eliminated
+                  ? mine.schedule.eliminated
+                  : { stage: st.eliminatedStage, at: null },
+              );
+            }
+            case 'entered': {
+              // The agent's own schedule is the source for its round and
+              // series (#938 review): `current` is its series in an open
+              // round, `next` its series in the next scheduled round, both
+              // chosen by the server among the rounds that seat this agent. A
+              // global timetable scan picked the wrong round once pool groups
+              // opened at different times. Best-effort: a failed read nulls
+              // these fields rather than failing the status (429s surface).
+              const mine = await readMySchedule(t.id);
+              if (!mine.ok && mine.httpStatus === 429) return { failure: readFailure(mine) };
+              const sched =
+                mine.ok && mine.schedule && typeof mine.schedule === 'object'
+                  ? mine.schedule
+                  : null;
+              // A server from before the waitlist stamps elimination only here.
+              if (sched?.eliminated) return eliminatedItem(item, st, sched.eliminated);
+              const current =
+                sched?.current && typeof sched.current === 'object' ? sched.current : null;
+              let round = current
+                ? {
+                    stage: current.stage,
+                    roundNumber: current.roundNumber,
+                    status: 'open',
+                    windowOpensAt: current.windowOpensAt ?? null,
+                    windowClosesAt: current.windowClosesAt ?? null,
+                  }
+                : null;
+              if (
+                !current &&
+                t.format === 'shootout' &&
+                typeof client.tournamentSchedule === 'function'
+              ) {
+                // A table format seats players in tables, never in a series,
+                // so the own schedule has no `current`; its rounds are
+                // poolless, so the timetable's single open shootout round is
+                // every entrant's round, with its window.
+                const timetable = await readWithRetry(() => client.tournamentSchedule(t.id));
+                if (!timetable.ok && timetable.httpStatus === 429) {
+                  return { failure: readFailure(timetable) };
+                }
+                const open =
+                  timetable.ok && Array.isArray(timetable.rounds)
+                    ? timetable.rounds.filter((r) => r?.status === 'open' && r.stage === 'shootout')
+                    : [];
+                if (open.length === 1) {
+                  round = {
+                    stage: open[0].stage,
+                    roundNumber: open[0].roundNumber,
+                    status: 'open',
+                    windowOpensAt: open[0].windowOpensAt ?? null,
+                    windowClosesAt: open[0].windowClosesAt ?? null,
+                  };
+                }
+              }
+              const series = current
+                ? [
+                    {
+                      seriesId: current.seriesId,
+                      opponentAgentId: current.opponentAgentId ?? null,
+                      opponentName: current.opponentAgentName ?? null,
+                      bestOfN: current.bestOfN,
+                      matchIds: Array.isArray(current.matchIds) ? current.matchIds : [],
+                      outcome: current.outcome ?? null,
+                      bye: current.bye === true,
+                      myGameWins: current.myGameWins ?? null,
+                      opponentGameWins: current.opponentGameWins ?? null,
+                    },
+                  ]
+                : [];
+              const stand = TOURNAMENT_PRE_PLAY_STATUSES.has(t.status)
+                ? { ok: true, standings: [] }
+                : await readWithRetry(() => client.tournamentStandings(t.id));
+              if (!stand.ok && stand.httpStatus === 429) return { failure: readFailure(stand) };
+              const rows = stand.ok ? stand.standings : [];
+              const standing = rows.find((row) => row?.agentId === creds.agentId) ?? null;
+              return {
+                ...item,
+                entry: st.entry,
+                round,
+                series,
+                next: sched?.next ?? null,
+                nextPlanned: sched?.nextPlanned ?? null,
+                pool: sched?.pool ?? null,
+                standing,
+              };
+            }
+            case 'closed_out':
+              return { ...item, entry: st.entry, guidance: TOURNAMENT_CLOSED_OUT_GUIDANCE };
+            default:
+              // withdrawn, forfeited, or a status this version does not know:
+              // the agent no longer plays here (or nothing says it does), so
+              // report and stop.
+              return { ...item, entry: st.entry };
+          }
+        };
+
+        const items = [];
+        for (const t of unfinished) {
+          const item = await statusItem(t);
+          if (item.failure) return toolText(item.failure);
+          items.push(item);
+        }
         // #922: attach the pending tournament match to this session, if any.
         // Last, after every read that can return rate_limited early, so an
-        // adoption is never performed and then dropped from the result.
-        const adoption = await adoptPendingTournamentMatch(ctx, creds, readWithRetry);
+        // adoption is never performed and then dropped from the result. Only
+        // an entered agent has a match coming; the match itself is the
+        // agent's, whichever tournament created it.
+        const adoption = items.some((it) => it.state === 'entered')
+          ? await adoptPendingTournamentMatch(ctx, creds, readWithRetry)
+          : {};
 
+        // The list in the server's order, one item per unfinished tournament,
+        // each with its own state and messaging (owner, #948: no main
+        // tournament is picked, ranked or summarized at the top).
         return toolText({
           ok: true,
-          state: 'entered',
-          tournament: t,
-          entry: me.entry,
-          round,
-          series,
-          standing,
-          ...messaging,
+          tournaments: items,
+          ...truncation,
           ...adoption,
         });
       } catch (err) {
@@ -1504,7 +1779,7 @@ export function registerPlugin(api, opts = {}) {
   api.registerTool(makeQueueTool({ client, server, cfg, logger, receiver, coordinator }), {
     name: 'queue_match',
   });
-  api.registerTool(makeLeaveQueueTool(), { name: 'leave_queue' });
+  api.registerTool(makeLeaveQueueTool({ client, coordinator, logger }), { name: 'leave_queue' });
   const infoFactories = makeInfoTools({ client });
   api.registerTool(infoFactories[0], { name: 'list_games' });
   api.registerTool(infoFactories[1], { name: 'get_rules' });
