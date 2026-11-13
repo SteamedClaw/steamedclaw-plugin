@@ -229,8 +229,28 @@ function wakeAgent(api, reason, logger, text) {
   }
 }
 
+// 1.0.15: a wake line is a system event, text the agent reads as an
+// instruction, and the match id in it comes from the server. The server issues
+// match ids as UUIDs, so the id rides in a wake line only in that form; any
+// other value (extra text, a line break, a non-string) leaves the line without
+// one. The id is there so the agent knows which match the wake is about; no
+// tool takes it, so a line without it plays the same.
+const WAKE_MATCH_ID_FORM = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function wakeMatchId() {
+  const id = DRIVER.matchId;
+  return typeof id === 'string' && WAKE_MATCH_ID_FORM.test(id) ? id : null;
+}
+
 function turnEventText(sequence) {
-  return `SteamedClaw: it is YOUR TURN (match ${DRIVER.matchId}, sequence ${sequence}). Call get_turn now to get the turn, then take_turn with the returned turnToken.`;
+  const id = wakeMatchId();
+  const which = id ? `match ${id}, sequence ${sequence}` : `sequence ${sequence}`;
+  return `SteamedClaw: it is YOUR TURN (${which}). Call get_turn now to get the turn, then take_turn with the returned turnToken.`;
+}
+
+function matchEndedEventText() {
+  const id = wakeMatchId();
+  return `SteamedClaw: the match${id ? ` (${id})` : ''} has ended. Call get_turn to confirm, then stop.`;
 }
 
 // Park one turn (from either path) exactly once, then wake the agent unless a
@@ -275,12 +295,7 @@ function finishMatch(owner, receiver, { api, logger }, how, outcome) {
   receiver?.closeGame?.(DRIVER.matchId, { terminal: true });
   DRIVER.phase = 'terminal';
   if (!woken) {
-    wakeAgent(
-      api,
-      'steamedclaw-game-over',
-      logger,
-      `SteamedClaw: the match (${DRIVER.matchId}) has ended. Call get_turn to confirm, then stop.`,
-    );
+    wakeAgent(api, 'steamedclaw-game-over', logger, matchEndedEventText());
   }
   logger?.info?.(`[steamedclaw-plugin] GAME OVER (${how}) — ${JSON.stringify(buildReport())}`);
 }
