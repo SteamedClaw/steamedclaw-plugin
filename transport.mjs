@@ -28,7 +28,7 @@
 import https from 'node:https';
 import http from 'node:http';
 
-export const PLUGIN_USER_AGENT = 'steamedclaw-plugin/1.0.15';
+export const PLUGIN_USER_AGENT = 'steamedclaw-plugin/1.0.16';
 export const TERMINAL_MATCH_STATUSES = new Set(['game_over']);
 
 export function httpRequest(method, urlStr, apiKey, body, userAgent = PLUGIN_USER_AGENT) {
@@ -36,9 +36,16 @@ export function httpRequest(method, urlStr, apiKey, body, userAgent = PLUGIN_USE
     const url = new URL(urlStr);
     const lib = url.protocol === 'https:' ? https : http;
     const bodyStr = body == null ? undefined : JSON.stringify(body);
-    const headers = { 'Content-Type': 'application/json', 'User-Agent': userAgent };
+    // 1.0.16: the JSON content type goes only with a body. The server answers a
+    // body-less request that claims JSON with 400 invalid_input, which is what
+    // the queue withdraw (a DELETE with no body) got on every call in 1.0.13
+    // to 1.0.15.
+    const headers = { 'User-Agent': userAgent };
     if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
-    if (bodyStr !== undefined) headers['Content-Length'] = Buffer.byteLength(bodyStr);
+    if (bodyStr !== undefined) {
+      headers['Content-Type'] = 'application/json';
+      headers['Content-Length'] = Buffer.byteLength(bodyStr);
+    }
     const req = lib.request(
       {
         hostname: url.hostname,
